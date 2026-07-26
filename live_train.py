@@ -17,6 +17,7 @@ Logs (live_log/):
 """
 
 import csv
+import glob
 import os
 import pickle
 import sys
@@ -128,13 +129,33 @@ def main():
         os.path.join(HERE, "live_neat_config.txt"),
     )
     os.makedirs(LOG_DIR, exist_ok=True)
-    _log["gf"] = open(os.path.join(LOG_DIR, "genomes.csv"), "w", newline="")
-    _log["sf"] = open(os.path.join(LOG_DIR, "generations.csv"), "w", newline="")
-    _log["gw"] = csv.writer(_log["gf"])
-    _log["gw"].writerow(["gen", "genome_id", "fitness", "max_percent", "complete", "steps"])
-    _log["sw"] = csv.writer(_log["sf"])
-    _log["sw"].writerow(["gen", "n_genomes", "best_fitness", "mean_fitness",
-                         "best_genome_id", "best_percent", "overall_best_percent"])
+    ckpt_prefix = os.path.join(LOG_DIR, "checkpoint-")
+    ckpts = sorted(glob.glob(ckpt_prefix + "*"),
+                   key=lambda p: int(p.rsplit("-", 1)[-1])) if glob.glob(ckpt_prefix + "*") else []
+
+    def _open_log(name, header):
+        path = os.path.join(LOG_DIR, name)
+        fresh = (not os.path.exists(path)) or os.path.getsize(path) == 0
+        f = open(path, "a", newline="")   # append so logs accumulate across runs
+        w = csv.writer(f)
+        if fresh:
+            w.writerow(header)
+        return f, w
+
+    _log["gf"], _log["gw"] = _open_log(
+        "genomes.csv", ["gen", "genome_id", "fitness", "max_percent", "complete", "steps"])
+    _log["sf"], _log["sw"] = _open_log(
+        "generations.csv", ["gen", "n_genomes", "best_fitness", "mean_fitness",
+                            "best_genome_id", "best_percent", "overall_best_percent"])
+    if ckpts:  # keep the running-best correct across resumes
+        try:
+            with open(os.path.join(LOG_DIR, "generations.csv")) as f:
+                vals = [float(r["overall_best_percent"]) for r in csv.DictReader(f)
+                        if r.get("overall_best_percent", "").strip()]
+            if vals:
+                _log["obest"] = max(vals)
+        except Exception:
+            pass
 
     env = LiveEnv()
     print("Waiting for the GDBot Bridge (start GD, enter a level)...")
@@ -143,9 +164,17 @@ def main():
         sys.exit(1)
     print(f"Connected. Evolving — watch the overlay. Logs -> {LOG_DIR}")
 
-    pop = neat.Population(config)
+    # Resume from the latest checkpoint so learning accumulates across runs.
+    if ckpts:
+        pop = neat.Checkpointer.restore_checkpoint(ckpts[-1])
+        print(f"Resumed population from {os.path.basename(ckpts[-1])} "
+              f"(continuing at generation {pop.generation})")
+    else:
+        pop = neat.Population(config)
+        print("Started a fresh population (no checkpoint found)")
     pop.add_reporter(neat.StdOutReporter(True))
     pop.add_reporter(GenLogger())
+    pop.add_reporter(neat.Checkpointer(generation_interval=5, filename_prefix=ckpt_prefix))
 
     try:
         winner = pop.run(eval_genomes, 300)
