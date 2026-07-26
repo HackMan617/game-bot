@@ -3,6 +3,7 @@ __pycache__/
 checkpoints/
 *.pkl
 *.png
+!assets/*.png
 *.log
 .venv/
 venv/

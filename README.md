@@ -1,6 +1,7 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="gdbot — a neural network that learns to play Geometry Dash" width="100%">
+  <img src="assets/screenshot.png" alt="gdbot — the live neural network (bottom) driving the cube through an unseen course (top)" width="100%">
 </p>
+<p align="center"><em>Live capture: the neural network (bottom) reacts to upcoming spikes and fires the JUMP node to clear them (top).</em></p>
 
 # gdbot — a bot that learns to play Geometry Dash
 
