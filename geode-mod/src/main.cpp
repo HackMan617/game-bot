@@ -16,6 +16,9 @@
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/CCScheduler.hpp>
+#include <Geode/binding/GameLevelManager.hpp>
+#include <Geode/binding/MenuLayer.hpp>
 #include <windows.h>
 #include <cstdint>
 
@@ -44,6 +47,10 @@ struct GDBotShared {
     int32_t practice;        // Python -> mod: 1 = practice mode + auto frontier checkpoints
     int32_t reset_epoch;     // Python -> mod: increment to clear checkpoints & restart from start
     int32_t checkpoint_count;// mod -> Python: number of active checkpoints
+    // --- level navigation ---
+    int32_t load_epoch;      // Python -> mod: increment to request a level load / leave
+    int32_t load_level_id;   // Python -> mod: official level id to load (1-21); 0 = go to menu
+    int32_t current_level_id;// mod -> Python: id of the level currently loaded (0 = menu)
 };
 #pragma pack(pop)
 
@@ -53,6 +60,8 @@ static int          g_lastAction = 0;
 static bool         g_practiceOn = false;
 static int          g_lastResetEpoch = 0;
 static float        g_lastCpX = -1e9f;
+static int          g_lastLoadEpoch = 0;
+static int          g_currentLevelId = 0;
 
 static void ensureShared() {
     if (g_shared) return;
@@ -167,5 +176,35 @@ class $modify(BridgePlayLayer, PlayLayer) {
         g_lastAction = 0;
         g_practiceOn = false;
         g_lastCpX = -1e9f;
+    }
+};
+
+// Global per-frame tick — runs even on the menu, so the agent can leave a level
+// and select another one while outside a PlayLayer.
+class $modify(BridgeScheduler, CCScheduler) {
+    void update(float dt) {
+        CCScheduler::update(dt);
+        ensureShared();
+        if (!g_shared) return;
+
+        auto pl = PlayLayer::get();
+        g_shared->current_level_id = pl ? g_currentLevelId : 0;
+
+        if (g_shared->load_epoch != g_lastLoadEpoch) {
+            g_lastLoadEpoch = g_shared->load_epoch;
+            g_practiceOn = false;      // force practice to re-toggle on the new level
+            g_lastCpX = -1e9f;
+            int id = g_shared->load_level_id;
+            if (id > 0) {
+                auto level = GameLevelManager::get()->getMainLevel(id, false);
+                if (level) {
+                    CCDirector::get()->replaceScene(PlayLayer::scene(level, false, false));
+                    g_currentLevelId = id;
+                }
+            } else {
+                CCDirector::get()->replaceScene(MenuLayer::scene(false));
+                g_currentLevelId = 0;
+            }
+        }
     }
 };

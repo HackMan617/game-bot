@@ -10,14 +10,27 @@ import struct
 
 LOOKAHEAD = 10
 # 7 int32, 5 float32, action int32, LOOKAHEAD spike int32s, LOOKAHEAD ground
-# float32s, then practice/reset_epoch/checkpoint_count int32s.
-_FMT = struct.Struct("<7i5fi%di%df3i" % (LOOKAHEAD, LOOKAHEAD))
+# float32s, then practice/reset_epoch/checkpoint_count + load_epoch/load_level_id/
+# current_level_id int32s.
+_FMT = struct.Struct("<7i5fi%di%df6i" % (LOOKAHEAD, LOOKAHEAD))
 _SIZE = 4096
 _TAG = "GDBotShared"
 MAGIC = 0x54444247  # 'GDBT'
 _ACTION_OFF = struct.calcsize("<7i5f")                              # action field (48)
 _PRACTICE_OFF = struct.calcsize("<7i5fi%di%df" % (LOOKAHEAD, LOOKAHEAD))  # practice (132)
 _RESET_OFF = _PRACTICE_OFF + 4                                      # reset_epoch (136)
+_LOAD_EPOCH_OFF = struct.calcsize("<7i5fi%di%df3i" % (LOOKAHEAD, LOOKAHEAD))  # load_epoch (144)
+_LOAD_ID_OFF = _LOAD_EPOCH_OFF + 4                                  # load_level_id (148)
+
+# Official main levels (id -> name); pass an id to load_level().
+OFFICIAL_LEVELS = {
+    1: "Stereo Madness", 2: "Back on Track", 3: "Polargeist", 4: "Dry Out",
+    5: "Base After Base", 6: "Can't Let Go", 7: "Jumper", 8: "Time Machine",
+    9: "Cycles", 10: "xStep", 11: "Clutterfunk", 12: "Theory of Everything",
+    13: "Electroman Adventures", 14: "Clubstep", 15: "Electrodynamix",
+    16: "Hexagon Force", 17: "Blast Processing", 18: "Theory of Everything 2",
+    19: "Geometrical Dominator", 20: "Deadlocked", 21: "Fingerdash",
+}
 
 _SCALARS = ("magic", "frame", "in_level", "dead", "on_ground", "gamemode",
             "attempt", "x", "y", "vy", "percent", "length", "action")
@@ -38,6 +51,9 @@ class LiveShared:
         d["practice"] = vals[base]
         d["reset_epoch"] = vals[base + 1]
         d["checkpoint_count"] = vals[base + 2]
+        d["load_epoch"] = vals[base + 3]
+        d["load_level_id"] = vals[base + 4]
+        d["current_level_id"] = vals[base + 5]
         return d
 
     def connected(self) -> bool:
@@ -58,6 +74,17 @@ class LiveShared:
         """Ask the mod to clear checkpoints and restart from the level start."""
         epoch = self.read()["reset_epoch"]
         self.mm[_RESET_OFF:_RESET_OFF + 4] = struct.pack("<i", epoch + 1)
+
+    def load_level(self, level_id: int) -> None:
+        """Load an official level by id (1-21), leaving the current one.
+        level_id 0 leaves to the main menu."""
+        self.mm[_LOAD_ID_OFF:_LOAD_ID_OFF + 4] = struct.pack("<i", int(level_id))
+        epoch = self.read()["load_epoch"]
+        self.mm[_LOAD_EPOCH_OFF:_LOAD_EPOCH_OFF + 4] = struct.pack("<i", epoch + 1)
+
+    def leave_to_menu(self) -> None:
+        """Quit the current level back to the main menu."""
+        self.load_level(0)
 
     def close(self) -> None:
         self.mm.close()
