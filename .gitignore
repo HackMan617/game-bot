@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+checkpoints/
+*.pkl
+*.png
+*.log
+.venv/
+venv/

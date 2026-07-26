@@ -1,0 +1,13 @@
+# Core learning + simulator (Phase 0/1 — no live game needed)
+neat-python==0.92
+numpy>=1.24
+pygame>=2.5
+matplotlib>=3.7
+
+# Live-game backend (Phase 2+ — uncomment when wiring up real Geometry Dash)
+# pymem>=1.13         # read GeometryDash.exe process memory
+# pydirectinput>=1.0  # fallback input injection (SendInput used directly otherwise)
+
+# Reinforcement-learning path (Phase 6 — deferred)
+# stable-baselines3>=2.2
+# torch>=2.2

@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-label="gdbot — a neural network that learns to play Geometry Dash">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0f1e"/>
+      <stop offset="1" stop-color="#05060d"/>
+    </linearGradient>
+    <linearGradient id="cube" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7CFFB2"/>
+      <stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+    <linearGradient id="title" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8be9fd"/>
+      <stop offset="0.5" stop-color="#7CFFB2"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0 H0 V40" fill="none" stroke="#18213c" stroke-width="1"/>
+    </pattern>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="300" fill="url(#bg)"/>
+  <rect width="1200" height="300" fill="url(#grid)" opacity="0.5"/>
+
+  <!-- ground scene -->
+  <rect x="0" y="252" width="740" height="48" fill="#111a30"/>
+  <line x1="0" y1="252" x2="740" y2="252" stroke="#2c3a63" stroke-width="2"/>
+  <g fill="#ef5350" stroke="#7f1d1d" stroke-width="1">
+    <path d="M76 252 L92 214 L108 252 Z"/>
+    <path d="M300 252 L316 214 L332 252 Z"/>
+    <path d="M360 252 L376 214 L392 252 Z"/>
+    <path d="M520 252 L536 214 L552 252 Z"/>
+    <path d="M636 252 L652 214 L668 252 Z"/>
+  </g>
+
+  <!-- cube mid-jump over a spike -->
+  <g transform="translate(196,196) rotate(18)" filter="url(#glow)">
+    <rect x="-27" y="-27" width="54" height="54" rx="7" fill="url(#cube)"/>
+    <rect x="-27" y="-27" width="54" height="54" rx="7" fill="none" stroke="#0b3d22" stroke-width="3"/>
+    <circle cx="-8" cy="-6" r="4" fill="#0b3d22"/>
+    <circle cx="10" cy="-6" r="4" fill="#0b3d22"/>
+  </g>
+  <path d="M150 232 Q196 150 250 214" fill="none" stroke="#7CFFB2" stroke-width="2" stroke-dasharray="4 6" opacity="0.6"/>
+
+  <!-- neural-network motif (echoes the in-game visualizer) -->
+  <g stroke-linecap="round">
+    <!-- edges: green = +weight, red = -weight -->
+    <g opacity="0.85">
+      <line x1="866" y1="70"  x2="1006" y2="120" stroke="#22c55e" stroke-width="3"/>
+      <line x1="866" y1="110" x2="1006" y2="120" stroke="#ef5350" stroke-width="2"/>
+      <line x1="866" y1="150" x2="1006" y2="120" stroke="#22c55e" stroke-width="2"/>
+      <line x1="866" y1="70"  x2="1006" y2="190" stroke="#ef5350" stroke-width="2"/>
+      <line x1="866" y1="150" x2="1006" y2="190" stroke="#22c55e" stroke-width="3"/>
+      <line x1="866" y1="190" x2="1006" y2="190" stroke="#22c55e" stroke-width="2"/>
+      <line x1="1006" y1="120" x2="1128" y2="150" stroke="#22c55e" stroke-width="4"/>
+      <line x1="1006" y1="190" x2="1128" y2="150" stroke="#ef5350" stroke-width="2"/>
+    </g>
+    <!-- input nodes -->
+    <g fill="#1b2745" stroke="#5b6b96" stroke-width="2">
+      <circle cx="866" cy="70"  r="9"/>
+      <circle cx="866" cy="110" r="9" fill="#ef5350" stroke="#7f1d1d"/>
+      <circle cx="866" cy="150" r="9"/>
+      <circle cx="866" cy="190" r="9" fill="#ef5350" stroke="#7f1d1d"/>
+    </g>
+    <!-- hidden nodes -->
+    <g fill="#243356" stroke="#5b6b96" stroke-width="2">
+      <circle cx="1006" cy="120" r="10"/>
+      <circle cx="1006" cy="190" r="10"/>
+    </g>
+    <!-- output (JUMP) -->
+    <circle cx="1128" cy="150" r="13" fill="url(#cube)" stroke="#eaeaf2" stroke-width="2" filter="url(#glow)"/>
+    <text x="1128" y="185" text-anchor="middle" font-family="ui-monospace, Consolas, monospace" font-size="12" fill="#9fb0d0">JUMP</text>
+  </g>
+
+  <!-- wordmark -->
+  <text x="60" y="118" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" font-size="88" font-weight="700" fill="url(#title)">gdbot</text>
+  <text x="64" y="158" font-family="'Segoe UI', system-ui, sans-serif" font-size="23" fill="#c7d2e8">a neural network that learns to play <tspan fill="#7CFFB2" font-weight="600">Geometry Dash</tspan></text>
+  <text x="64" y="188" font-family="'Segoe UI', system-ui, sans-serif" font-size="15" fill="#6b7ba0">NEAT neuroevolution · reactive generalist · GD 2.2 · inspired by MarI/O</text>
+</svg>
