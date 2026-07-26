@@ -13,6 +13,23 @@ macro for one.
 
 See [`plan`](.) for the full architecture and roadmap.
 
+## Live demonstration — real Geometry Dash
+
+The bot playing **Stereo Madness** on real 64-bit GD 2.2 (driven through the Geode
+bridge), and the live neural network controlling it:
+
+<p align="center">
+  <img src="assets/live_game.png" alt="The bot playing Stereo Madness in real Geometry Dash" width="70%">
+  <br><br>
+  <img src="assets/live_network.png" alt="The live neural-network overlay driving the bot" width="70%">
+</p>
+<p align="center"><em>Top: the network drives the real cube (mid-jump). Bottom: the live overlay — look-ahead cells light up as hazards approach and fire the JUMP node.</em></p>
+
+Over an unattended ~80-generation run the reactive network learned to jump the
+spikes and blocks it sees, reaching **~19% of Stereo Madness** before plateauing.
+Full results: [`demo/training-report.pdf`](demo/training-report.pdf) (learning
+curve, fitness, per-genome breakdown), with the raw logs in [`demo/`](demo/).
+
 ## How it's built
 
 One environment interface, two interchangeable backends:
