@@ -26,7 +26,7 @@ import numpy as np
 import pygame
 
 from gdbot import netviz
-from gdbot.live_env import LiveEnv
+from gdbot.live_env import BridgeLost, LiveEnv
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "live_log")
@@ -152,13 +152,19 @@ def main():
         with open(os.path.join(HERE, "live_winner.pkl"), "wb") as f:
             pickle.dump(winner, f)
         print(f"Saved live_winner.pkl (fitness={winner.fitness:.3f})")
-    except KeyboardInterrupt:
-        print("\nstopped.")
+    except (KeyboardInterrupt, BridgeLost) as exc:
+        print(f"\nstopped: {exc}")
+        best = getattr(pop, "best_genome", None)
+        if best is not None:
+            with open(os.path.join(HERE, "live_winner.pkl"), "wb") as f:
+                pickle.dump(best, f)
+            print(f"Saved best-so-far genome (fitness={best.fitness})")
     finally:
         env.close()
         for k in ("gf", "sf"):
             if _log[k]:
                 _log[k].close()
+        print("logs finalized in", LOG_DIR)
 
 
 if __name__ == "__main__":

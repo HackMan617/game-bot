@@ -17,11 +17,16 @@ from .game_state import GameState
 from .live_shared import LiveShared
 
 
+class BridgeLost(RuntimeError):
+    """The mod stopped publishing frames (game closed / left the level)."""
+
+
 class LiveEnv(GDEnv):
-    def __init__(self, poll_hz: float = 300.0):
+    def __init__(self, poll_hz: float = 300.0, disconnect_timeout: float = 10.0):
         self.sh = LiveShared()
         self._period = 1.0 / poll_hz
         self._last_frame = -1
+        self._disconnect_timeout = disconnect_timeout
 
     # --- connection helpers ----------------------------------------------------
     def wait_connected(self, timeout: float = None) -> bool:
@@ -34,12 +39,20 @@ class LiveEnv(GDEnv):
         return True
 
     def _next_frame(self) -> dict:
-        """Block until the mod advances one physics frame; return the state."""
+        """Block until the mod advances one physics frame; return the state.
+
+        Raises BridgeLost if no new frame arrives within disconnect_timeout
+        (the game was closed or left the level) so callers can exit cleanly.
+        """
+        start = time.time()
         while True:
             st = self.sh.read()
             if st["frame"] != self._last_frame and st["magic"] != 0:
                 self._last_frame = st["frame"]
                 return st
+            if time.time() - start > self._disconnect_timeout:
+                raise BridgeLost(
+                    f"no frames for {self._disconnect_timeout:.0f}s (game closed?)")
             time.sleep(self._period)
 
     # --- GDEnv interface -------------------------------------------------------
