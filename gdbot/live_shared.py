@@ -9,8 +9,8 @@ import mmap
 import struct
 
 LOOKAHEAD = 10
-# 7 int32, 5 float32, action int32, then LOOKAHEAD spike int32s
-_FMT = struct.Struct("<7i5fi%di" % LOOKAHEAD)
+# 7 int32, 5 float32, action int32, LOOKAHEAD spike int32s, LOOKAHEAD ground float32s
+_FMT = struct.Struct("<7i5fi%di%df" % (LOOKAHEAD, LOOKAHEAD))
 _SIZE = 4096
 _TAG = "GDBotShared"
 MAGIC = 0x54444247  # 'GDBT'
@@ -30,6 +30,7 @@ class LiveShared:
         vals = _FMT.unpack(self.mm[:_FMT.size])
         d = dict(zip(_SCALARS, vals[:13]))
         d["spike"] = list(vals[13:13 + LOOKAHEAD])
+        d["ground"] = list(vals[13 + LOOKAHEAD:13 + 2 * LOOKAHEAD])
         return d
 
     def connected(self) -> bool:

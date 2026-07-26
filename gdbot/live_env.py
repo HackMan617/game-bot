@@ -64,13 +64,15 @@ class LiveEnv(GDEnv):
 
     # --- state -----------------------------------------------------------------
     def _state(self, st: dict) -> GameState:
-        # Reactive lookahead from the mod's forward hazard grid: (surface, spike)
-        # per forward cell. Surface height isn't streamed yet, so 0.0 (spikes are
-        # the killers in cube mode); block/step height can be added later.
+        # Reactive lookahead from the mod's forward grid: (surface_height, spike)
+        # per forward cell. surface_height is the tallest solid ahead relative to
+        # the player, converted to blocks (30 units = 1 block); spike marks hazards.
         spikes = st.get("spike", [0] * 10)
+        ground = st.get("ground", [0.0] * 10)
 
         def lookahead(k):
-            return [(0.0, bool(spikes[i]) if i < len(spikes) else False)
+            return [((ground[i] / 30.0) if i < len(ground) else 0.0,
+                     bool(spikes[i]) if i < len(spikes) else False)
                     for i in range(k)]
 
         return GameState(

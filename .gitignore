@@ -11,3 +11,6 @@ venv/
 # Geode mod build artifacts
 geode-mod/build/
 *.geode
+
+# Live training run logs
+live_log/

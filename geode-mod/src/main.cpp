@@ -37,7 +37,9 @@ struct GDBotShared {
     float   percent;    // 0..1 progress
     float   length;     // level length (x units)
     int32_t action;     // Python -> mod: 1 = hold jump, 0 = release
-    int32_t spike[GDBOT_LOOKAHEAD];  // 1 if a Hazard sits in that forward cell
+    int32_t spike[GDBOT_LOOKAHEAD];   // 1 if a Hazard sits in that forward cell
+    float   ground[GDBOT_LOOKAHEAD];  // height of the highest Solid top in that
+                                      // cell relative to the player (units; 0 = flat)
 };
 #pragma pack(pop)
 
@@ -93,17 +95,25 @@ class $modify(BridgePlayLayer, PlayLayer) {
         g_shared->length     = m_levelLength;
         g_shared->percent    = m_levelLength > 0.f ? p->getPositionX() / m_levelLength : 0.f;
 
-        // --- forward hazard grid: mark cells (1 block = 30 units) ahead that
-        // contain a Hazard object, so the network can react to spikes it "sees".
-        for (int i = 0; i < GDBOT_LOOKAHEAD; i++) g_shared->spike[i] = 0;
+        // --- forward grid (1 block = 30 units): per cell ahead, flag Hazards
+        // (spikes to jump over) and record the tallest Solid top relative to the
+        // player (blocks to jump onto), so the network reacts to what it "sees".
+        for (int i = 0; i < GDBOT_LOOKAHEAD; i++) { g_shared->spike[i] = 0; g_shared->ground[i] = 0.f; }
         if (m_objects) {
             float px = p->getPositionX();
+            float py = p->getPositionY();
             for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
-                if (obj->getType() != GameObjectType::Hazard) continue;
                 float dx = obj->getPositionX() - px;
                 if (dx <= 0.f || dx > GDBOT_LOOKAHEAD * 30.f) continue;
                 int i = (int)(dx / 30.f);
-                if (i >= 0 && i < GDBOT_LOOKAHEAD) g_shared->spike[i] = 1;
+                if (i < 0 || i >= GDBOT_LOOKAHEAD) continue;
+                auto t = obj->getType();
+                if (t == GameObjectType::Hazard) {
+                    g_shared->spike[i] = 1;
+                } else if (t == GameObjectType::Solid || t == GameObjectType::Slope) {
+                    float rel = (obj->getPositionY() + 15.f) - py;  // block top vs cube
+                    if (rel > g_shared->ground[i]) g_shared->ground[i] = rel;
+                }
             }
         }
 
