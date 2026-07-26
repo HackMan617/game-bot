@@ -1,0 +1,12 @@
+{
+    "geode": "5.8.2",
+    "gd": {
+        "win": "2.2081"
+    },
+    "id": "gdbot.bridge",
+    "name": "GDBot Bridge",
+    "version": "v0.1.0",
+    "developer": "gdbot",
+    "description": "Streams live PlayLayer state to shared memory and applies bot jump actions, for the gdbot learning agent.",
+    "tags": ["utility", "offline"]
+}

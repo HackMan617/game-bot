@@ -7,3 +7,7 @@ checkpoints/
 *.log
 .venv/
 venv/
+
+# Geode mod build artifacts
+geode-mod/build/
+*.geode

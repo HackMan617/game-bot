@@ -4,9 +4,9 @@ numpy>=1.24
 pygame>=2.5
 matplotlib>=3.7
 
-# Live-game backend (Phase 2+ — uncomment when wiring up real Geometry Dash)
-# pymem>=1.13         # read GeometryDash.exe process memory
-# pydirectinput>=1.0  # fallback input injection (SendInput used directly otherwise)
+# Live-game backend: state comes from the GDBot Bridge Geode mod (see geode-mod/)
+# via shared memory, read with the Python stdlib `mmap` — no extra deps needed.
+# (GD 2.2 is 64-bit with no public offsets, so we use a Geode mod, not raw pymem.)
 
 # Reinforcement-learning path (Phase 6 — deferred)
 # stable-baselines3>=2.2

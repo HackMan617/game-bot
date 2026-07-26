@@ -56,14 +56,33 @@ nodes brighten with activation (spike cells light up just before it jumps).
 | `gdbot/game_state.py` | backend-agnostic per-frame state schema |
 | `gdbot/observation.py` | GameState → network input vector (`OBS_SIZE`) |
 | `gdbot/neat_core.py` | NEAT evaluation + training loop |
+| `gdbot/netviz.py` | MarI/O-style live network renderer |
+| `gdbot/live_shared.py` | read live GD state from the Geode bridge (shared memory) |
+| `geode-mod/` | **GDBot Bridge** — Geode mod streaming state & applying jump actions |
 | `neat_config.txt` | NEAT hyperparameters (`num_inputs` must equal `OBS_SIZE`) |
-| `train.py` / `play.py` | train the bot / watch it play |
+| `train.py` / `play.py` / `watch.py` | train / replay / watch (game + live network) |
+
+## Reading the real game (Phase 2)
+
+GD 2.2 on Windows is a **64-bit** process with no reliable public memory offsets,
+so instead of raw pointer chases we read state through a small **Geode mod**
+([`geode-mod/`](geode-mod/)). Geode resolves class member offsets per version, so
+we get exact `PlayLayer`/`PlayerObject` state (and frame-perfect control via
+`pushButton`) with no version-pinned addresses. The mod writes state to a named
+shared-memory block every physics frame; Python reads it via `gdbot/live_shared.py`.
+
+Setup + build steps are in [`geode-mod/README.md`](geode-mod/README.md). Once the
+mod is installed and GD is in a level:
+
+```bash
+python -m gdbot.live_shared   # live x / y / % / mode / dead from the game
+```
 
 ## Roadmap
 
 - **Phase 1 (done):** SimEnv + NEAT — prove the network learns, offline.
-- **Phase 2:** `gd_memory.py` (pymem) + `calibrate.py` — read real GD state.
-- **Phase 3:** `gd_input.py` (SendInput) + `live_env.py` — close the real-game loop.
+- **Phase 2 (in progress):** `geode-mod/` Geode bridge + `gdbot/live_shared.py` — read/control real GD.
+- **Phase 3:** `live_env.py` — wrap the bridge as a `GDEnv` so the trained brain drives the game.
 - **Phase 4:** `level_parser.py` — build the real level's hazard grid for lookahead.
 - **Phase 5:** train on real levels; add speedup + more gamemodes (ship/wave/…).
 - **Phase 6:** PPO/DQN path via the same `GDEnv`.
