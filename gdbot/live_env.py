@@ -22,11 +22,20 @@ class BridgeLost(RuntimeError):
 
 
 class LiveEnv(GDEnv):
-    def __init__(self, poll_hz: float = 300.0, disconnect_timeout: float = 10.0):
+    def __init__(self, poll_hz: float = 300.0, disconnect_timeout: float = 10.0,
+                 practice: bool = False):
         self.sh = LiveShared()
         self._period = 1.0 / poll_hz
         self._last_frame = -1
         self._disconnect_timeout = disconnect_timeout
+        self.practice = practice
+        if practice:
+            self.sh.set_practice(True)   # mod runs practice mode + frontier checkpoints
+
+    def request_full_reset(self) -> None:
+        """Leave practice mode and restart from the level start (for a full run)."""
+        self.sh.set_practice(False)
+        self.sh.request_reset()
 
     # --- connection helpers ----------------------------------------------------
     def wait_connected(self, timeout: float = None) -> bool:
@@ -57,11 +66,16 @@ class LiveEnv(GDEnv):
 
     # --- GDEnv interface -------------------------------------------------------
     def reset(self) -> GameState:
-        """Wait for a fresh attempt to begin (alive, near the start)."""
+        """Wait for the next attempt to begin.
+
+        Normal mode: from the level start (percent ~ 0). Practice mode: at the
+        last checkpoint (any live, not-dead frame after a respawn)."""
         self.sh.set_action(False)
         while True:
             st = self._next_frame()
-            if st["in_level"] and not st["dead"] and st["percent"] < 0.03:
+            if not st["in_level"] or st["dead"]:
+                continue
+            if self.practice or st["percent"] < 0.03:
                 return self._state(st)
 
     def step(self, action: int):

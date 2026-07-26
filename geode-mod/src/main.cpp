@@ -40,12 +40,19 @@ struct GDBotShared {
     int32_t spike[GDBOT_LOOKAHEAD];   // 1 if a Hazard sits in that forward cell
     float   ground[GDBOT_LOOKAHEAD];  // height of the highest Solid top in that
                                       // cell relative to the player (units; 0 = flat)
+    // --- practice-mode curriculum ---
+    int32_t practice;        // Python -> mod: 1 = practice mode + auto frontier checkpoints
+    int32_t reset_epoch;     // Python -> mod: increment to clear checkpoints & restart from start
+    int32_t checkpoint_count;// mod -> Python: number of active checkpoints
 };
 #pragma pack(pop)
 
 static GDBotShared* g_shared = nullptr;
 static HANDLE       g_map = nullptr;
 static int          g_lastAction = 0;
+static bool         g_practiceOn = false;
+static int          g_lastResetEpoch = 0;
+static float        g_lastCpX = -1e9f;
 
 static void ensureShared() {
     if (g_shared) return;
@@ -117,6 +124,30 @@ class $modify(BridgePlayLayer, PlayLayer) {
             }
         }
 
+        // --- practice-mode curriculum: in practice mode, drop a checkpoint every
+        // few blocks of new progress; GD respawns at the last checkpoint on death,
+        // so the agent grinds each segment instead of restarting from 0%.
+        bool wantPractice = g_shared->practice != 0;
+        if (wantPractice != g_practiceOn) {
+            this->togglePracticeMode(wantPractice);
+            g_practiceOn = wantPractice;
+            g_lastCpX = -1e9f;
+        }
+        if (g_shared->reset_epoch != g_lastResetEpoch) {
+            g_lastResetEpoch = g_shared->reset_epoch;
+            this->removeAllCheckpoints();
+            this->resetLevelFromStart();
+            g_lastCpX = -1e9f;
+        }
+        if (g_practiceOn && !p->m_isDead) {
+            float cx = p->getPositionX();
+            if (cx > g_lastCpX + 200.f) {   // ~6.5 blocks between checkpoints
+                this->createCheckpoint();
+                g_lastCpX = cx;
+            }
+        }
+        g_shared->checkpoint_count = m_checkpointArray ? m_checkpointArray->count() : 0;
+
         // Apply the agent's action as an edge-triggered jump (same path as real input).
         int act = g_shared->action;
         if (act && !g_lastAction) this->handleButton(true, 1, true);
@@ -134,5 +165,7 @@ class $modify(BridgePlayLayer, PlayLayer) {
         PlayLayer::onQuit();
         if (g_shared) { g_shared->in_level = 0; g_shared->dead = 0; }
         g_lastAction = 0;
+        g_practiceOn = false;
+        g_lastCpX = -1e9f;
     }
 };

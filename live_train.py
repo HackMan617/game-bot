@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "live_log")
 LIVE_OBS = 22  # 10 cells x (surface, spike) + on-ground + vy
 
-_hud = {"gen": 0, "genome": 0, "best": 0.0, "pct": 0.0, "obest": 0.0}
+_hud = {"gen": 0, "genome": 0, "best": 0.0, "pct": 0.0, "obest": 0.0, "cp": 0}
 _win = {"screen": None, "clock": None, "font": None}
 _genome_stats = {}                      # gid -> {percent, steps, complete}
 _log = {"gw": None, "sw": None, "gf": None, "sf": None, "obest": 0.0}
@@ -64,7 +64,7 @@ def _overlay(net):
     s = w["screen"]
     s.fill((10, 10, 16))
     hud = (f"gen {_hud['gen']}  genome {_hud['genome']}  best {_hud['best']:.2f}  "
-           f"now {_hud['pct']*100:4.1f}%  best% {_hud['obest']*100:4.1f}")
+           f"now {_hud['pct']*100:4.1f}%  best% {_hud['obest']*100:4.1f}  cp {_hud['cp']}")
     s.blit(w["font"].render(hud, True, (235, 235, 245)), (14, 12))
     netviz.draw_network(s, net, pygame.Rect(0, 44, 760, 416))
     pygame.display.flip()
@@ -80,10 +80,11 @@ def eval_genomes(genomes, config):
         while True:
             action = 1 if net.activate(build_obs(state))[0] > 0.5 else 0
             _overlay(net)
-            state, _r, done, _info = env.step(action)
+            state, _r, done, info = env.step(action)
             best = max(best, state.percent)
             steps += 1
             _hud["pct"] = state.percent
+            _hud["cp"] = info.get("checkpoint_count", 0)
             if done:
                 break
         genome.fitness = best + (1.0 if state.complete else 0.0)
@@ -157,11 +158,15 @@ def main():
         except Exception:
             pass
 
-    env = LiveEnv()
+    practice = "practice" in sys.argv
+    env = LiveEnv(practice=practice)
     print("Waiting for the GDBot Bridge (start GD, enter a level)...")
     if not env.wait_connected(timeout=120):
         print("Bridge never connected — is the mod installed and are you in a level?")
         sys.exit(1)
+    if practice:
+        env.sh.request_reset()   # clear any old checkpoints and start fresh
+        print("Practice-mode curriculum ENABLED — grinding segments from checkpoints.")
     print(f"Connected. Evolving — watch the overlay. Logs -> {LOG_DIR}")
 
     # Resume from the latest checkpoint so learning accumulates across runs.

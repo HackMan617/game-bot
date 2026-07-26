@@ -9,12 +9,15 @@ import mmap
 import struct
 
 LOOKAHEAD = 10
-# 7 int32, 5 float32, action int32, LOOKAHEAD spike int32s, LOOKAHEAD ground float32s
-_FMT = struct.Struct("<7i5fi%di%df" % (LOOKAHEAD, LOOKAHEAD))
+# 7 int32, 5 float32, action int32, LOOKAHEAD spike int32s, LOOKAHEAD ground
+# float32s, then practice/reset_epoch/checkpoint_count int32s.
+_FMT = struct.Struct("<7i5fi%di%df3i" % (LOOKAHEAD, LOOKAHEAD))
 _SIZE = 4096
 _TAG = "GDBotShared"
 MAGIC = 0x54444247  # 'GDBT'
-_ACTION_OFF = struct.calcsize("<7i5f")  # byte offset of the action field (48)
+_ACTION_OFF = struct.calcsize("<7i5f")                              # action field (48)
+_PRACTICE_OFF = struct.calcsize("<7i5fi%di%df" % (LOOKAHEAD, LOOKAHEAD))  # practice (132)
+_RESET_OFF = _PRACTICE_OFF + 4                                      # reset_epoch (136)
 
 _SCALARS = ("magic", "frame", "in_level", "dead", "on_ground", "gamemode",
             "attempt", "x", "y", "vy", "percent", "length", "action")
@@ -31,6 +34,10 @@ class LiveShared:
         d = dict(zip(_SCALARS, vals[:13]))
         d["spike"] = list(vals[13:13 + LOOKAHEAD])
         d["ground"] = list(vals[13 + LOOKAHEAD:13 + 2 * LOOKAHEAD])
+        base = 13 + 2 * LOOKAHEAD
+        d["practice"] = vals[base]
+        d["reset_epoch"] = vals[base + 1]
+        d["checkpoint_count"] = vals[base + 2]
         return d
 
     def connected(self) -> bool:
@@ -42,6 +49,15 @@ class LiveShared:
     def set_action(self, jump: bool) -> None:
         """Write only the action field so we never clobber the mod's writes."""
         self.mm[_ACTION_OFF:_ACTION_OFF + 4] = struct.pack("<i", 1 if jump else 0)
+
+    def set_practice(self, on: bool) -> None:
+        """Enable/disable practice mode + auto frontier-checkpoints in the mod."""
+        self.mm[_PRACTICE_OFF:_PRACTICE_OFF + 4] = struct.pack("<i", 1 if on else 0)
+
+    def request_reset(self) -> None:
+        """Ask the mod to clear checkpoints and restart from the level start."""
+        epoch = self.read()["reset_epoch"]
+        self.mm[_RESET_OFF:_RESET_OFF + 4] = struct.pack("<i", epoch + 1)
 
     def close(self) -> None:
         self.mm.close()
