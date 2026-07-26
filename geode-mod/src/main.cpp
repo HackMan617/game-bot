@@ -21,6 +21,8 @@
 
 using namespace geode::prelude;
 
+#define GDBOT_LOOKAHEAD 10   // forward cells; 1 cell = 1 block = 30 GD units
+
 #pragma pack(push, 1)
 struct GDBotShared {
     int32_t magic;      // 'GDBT' = 0x54444247
@@ -35,6 +37,7 @@ struct GDBotShared {
     float   percent;    // 0..1 progress
     float   length;     // level length (x units)
     int32_t action;     // Python -> mod: 1 = hold jump, 0 = release
+    int32_t spike[GDBOT_LOOKAHEAD];  // 1 if a Hazard sits in that forward cell
 };
 #pragma pack(pop)
 
@@ -89,6 +92,20 @@ class $modify(BridgePlayLayer, PlayLayer) {
         g_shared->vy         = static_cast<float>(p->m_yVelocity);
         g_shared->length     = m_levelLength;
         g_shared->percent    = m_levelLength > 0.f ? p->getPositionX() / m_levelLength : 0.f;
+
+        // --- forward hazard grid: mark cells (1 block = 30 units) ahead that
+        // contain a Hazard object, so the network can react to spikes it "sees".
+        for (int i = 0; i < GDBOT_LOOKAHEAD; i++) g_shared->spike[i] = 0;
+        if (m_objects) {
+            float px = p->getPositionX();
+            for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
+                if (obj->getType() != GameObjectType::Hazard) continue;
+                float dx = obj->getPositionX() - px;
+                if (dx <= 0.f || dx > GDBOT_LOOKAHEAD * 30.f) continue;
+                int i = (int)(dx / 30.f);
+                if (i >= 0 && i < GDBOT_LOOKAHEAD) g_shared->spike[i] = 1;
+            }
+        }
 
         // Apply the agent's action as an edge-triggered jump (same path as real input).
         int act = g_shared->action;

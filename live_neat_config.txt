@@ -1,6 +1,6 @@
-# NEAT config for LIVE (real-game) learning on one level.
-# num_inputs = 4 (percent, y, vy, on_ground). Per-genome fitness = max percent
-# reached (+1.0 completion bonus), so max ~2.0; threshold ~= "beats the level".
+# NEAT config for LIVE (real-game) reactive learning.
+# num_inputs = 12 (10 forward spike cells + on_ground + vy). Per-genome fitness =
+# max percent reached (+1.0 completion bonus), so max ~2.0; threshold ~= beats it.
 
 [NEAT]
 fitness_criterion     = max
@@ -9,7 +9,7 @@ pop_size              = 24
 reset_on_extinction   = True
 
 [DefaultGenome]
-num_inputs              = 4
+num_inputs              = 12
 num_hidden              = 0
 num_outputs             = 1
 initial_connection      = full_direct

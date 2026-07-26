@@ -24,17 +24,17 @@ from gdbot import netviz
 from gdbot.live_env import LiveEnv
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LIVE_OBS = 4
+LIVE_OBS = 12  # 10 forward spike cells + on-ground + vy
 _hud = {"gen": 0, "genome": 0, "best": 0.0, "pct": 0.0}
 _win = {"screen": None, "clock": None, "font": None}
 
 
 def build_obs(state) -> np.ndarray:
-    return np.array([
-        state.percent,
-        float(np.clip(state.player_y / 500.0, -1.0, 1.0)),
-        float(np.clip(state.vy / 1000.0, -1.0, 1.0)),
+    """Reactive observation: what hazards are ahead + current motion."""
+    spikes = [1.0 if sp else 0.0 for _, sp in state.lookahead(10)]
+    return np.array(spikes + [
         1.0 if state.on_ground else 0.0,
+        float(np.clip(state.vy / 1000.0, -1.0, 1.0)),
     ], dtype=np.float32)
 
 

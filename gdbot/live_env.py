@@ -64,10 +64,14 @@ class LiveEnv(GDEnv):
 
     # --- state -----------------------------------------------------------------
     def _state(self, st: dict) -> GameState:
-        # No hazard data yet -> empty lookahead. When the mod streams nearby
-        # objects, fill this from them and the reactive observation lights up.
+        # Reactive lookahead from the mod's forward hazard grid: (surface, spike)
+        # per forward cell. Surface height isn't streamed yet, so 0.0 (spikes are
+        # the killers in cube mode); block/step height can be added later.
+        spikes = st.get("spike", [0] * 10)
+
         def lookahead(k):
-            return [(0.0, False)] * k
+            return [(0.0, bool(spikes[i]) if i < len(spikes) else False)
+                    for i in range(k)]
 
         return GameState(
             player_x=st["x"], player_y=st["y"], vy=st["vy"],

@@ -1,37 +1,38 @@
 """Python side of the GDBot Bridge shared-memory contract.
 
 Mirrors `struct GDBotShared` in geode-mod/src/main.cpp. The Geode mod (running
-inside GeometryDash.exe) writes state every physics frame; we read it here and
-write back the jump action. Same-session, page-file-backed named mapping.
+inside GeometryDash.exe) writes state + a forward hazard grid every physics
+frame; we read it here and write back the jump action.
 """
 
 import mmap
 import struct
 
-# 7 int32, 5 float32, 1 int32  (see GDBotShared)
-_FMT = struct.Struct("<7i5fi")
+LOOKAHEAD = 10
+# 7 int32, 5 float32, action int32, then LOOKAHEAD spike int32s
+_FMT = struct.Struct("<7i5fi%di" % LOOKAHEAD)
 _SIZE = 4096
 _TAG = "GDBotShared"
 MAGIC = 0x54444247  # 'GDBT'
-_ACTION_OFF = _FMT.size - 4  # last field
+_ACTION_OFF = struct.calcsize("<7i5f")  # byte offset of the action field (48)
 
-_FIELDS = ("magic", "frame", "in_level", "dead", "on_ground", "gamemode",
-           "attempt", "x", "y", "vy", "percent", "length", "action")
+_SCALARS = ("magic", "frame", "in_level", "dead", "on_ground", "gamemode",
+            "attempt", "x", "y", "vy", "percent", "length", "action")
 
 
 class LiveShared:
     """Reader/writer for the mod's shared-memory block."""
 
     def __init__(self):
-        # tagname opens the same named mapping the mod created (or creates it
-        # first if Python starts before the mod).
         self.mm = mmap.mmap(-1, _SIZE, tagname=_TAG)
 
     def read(self) -> dict:
-        return dict(zip(_FIELDS, _FMT.unpack(self.mm[:_FMT.size])))
+        vals = _FMT.unpack(self.mm[:_FMT.size])
+        d = dict(zip(_SCALARS, vals[:13]))
+        d["spike"] = list(vals[13:13 + LOOKAHEAD])
+        return d
 
     def connected(self) -> bool:
-        """True once the mod has initialized the block (magic stamped)."""
         try:
             return _FMT.unpack(self.mm[:_FMT.size])[0] == MAGIC
         except Exception:
@@ -46,10 +47,9 @@ class LiveShared:
 
 
 if __name__ == "__main__":
-    # Quick live probe: python -m gdbot.live_shared
     import time
     s = LiveShared()
-    print("Waiting for GDBot Bridge mod... (start GD with the mod installed)")
+    print("Waiting for GDBot Bridge mod... (start GD, enter a level)")
     while not s.connected():
         time.sleep(0.5)
     print("connected. Enter a level.")
@@ -58,7 +58,7 @@ if __name__ == "__main__":
         st = s.read()
         if st["frame"] != last:
             last = st["frame"]
-            print(f"in_level={st['in_level']} x={st['x']:.1f} y={st['y']:.1f} "
-                  f"{st['percent']*100:.1f}% mode={st['gamemode']} "
-                  f"dead={st['dead']} grnd={st['on_ground']} att={st['attempt']}")
+            grid = "".join("#" if x else "." for x in st["spike"])
+            print(f"x={st['x']:7.1f} {st['percent']*100:5.1f}% mode={st['gamemode']} "
+                  f"dead={st['dead']} grnd={st['on_ground']} spikes[{grid}]")
         time.sleep(0.05)
