@@ -69,8 +69,11 @@ static int currentMode(PlayerObject* p) {
 }
 
 class $modify(BridgePlayLayer, PlayLayer) {
-    void update(float dt) {
-        PlayLayer::update(dt);   // run the game's real physics first
+    // PlayLayer has no own update(); the per-frame method it overrides is
+    // postUpdate (runs each frame after physics). GJBaseGameLayer::update is the
+    // base loop, but postUpdate keeps `this` a PlayLayer so all fields resolve.
+    void postUpdate(float dt) {
+        PlayLayer::postUpdate(dt);
         ensureShared();
         if (!g_shared) return;
 
