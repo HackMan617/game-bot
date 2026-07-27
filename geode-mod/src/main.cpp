@@ -189,6 +189,7 @@ class $modify(BridgeScheduler, CCScheduler) {
 
         auto pl = PlayLayer::get();
         g_shared->current_level_id = pl ? g_currentLevelId : 0;
+        if (!pl) g_shared->in_level = 0;   // accurate on the menu (onQuit is skipped on replaceScene)
 
         if (g_shared->load_epoch != g_lastLoadEpoch) {
             g_lastLoadEpoch = g_shared->load_epoch;
