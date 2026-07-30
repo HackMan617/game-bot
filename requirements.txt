@@ -1,13 +1,13 @@
-# Core learning + simulator (Phase 0/1 — no live game needed)
-neat-python==0.92
+# Core: the PPO agent and the environments.
 numpy>=1.24
-pygame>=2.5
+torch>=2.2
+
+# The browser viewer: a websocket push channel plus the stdlib http server.
+websockets>=12
+
+# Offline reports over the CSV logs a run writes to runs/<name>/.
 matplotlib>=3.7
 
-# Live-game backend: state comes from the GDBot Bridge Geode mod (see geode-mod/)
-# via shared memory, read with the Python stdlib `mmap` — no extra deps needed.
-# (GD 2.2 is 64-bit with no public offsets, so we use a Geode mod, not raw pymem.)
-
-# Reinforcement-learning path (Phase 6 — deferred)
-# stable-baselines3>=2.2
-# torch>=2.2
+# The live backend needs no extra packages — state comes from the GDBot Bridge
+# Geode mod (see geode-mod/) through named shared memory and two Win32 events,
+# read with the stdlib mmap and ctypes. Windows only, by way of the game.

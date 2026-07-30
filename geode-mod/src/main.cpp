@@ -82,7 +82,7 @@ struct GDBotShared {
     int32_t in_level;
     int32_t dead;
     int32_t on_ground;
-    int32_t gamemode;         // matches gdbot.game_state ids (0 = cube)
+    int32_t gamemode;         // matches the gdbot.obs ids (0 = cube)
     int32_t attempt;
     int32_t upside_down;
     int32_t level_id;         // 0 = not in a level
@@ -166,7 +166,7 @@ static void ensureShared() {
               GDBOT_VERSION, (int)sizeof(GDBotShared));
 }
 
-// gamemode ids must match gdbot/game_state.py
+// gamemode ids must match gdbot/obs.py
 static int currentMode(PlayerObject* p) {
     if (p->m_isShip)   return 1; // SHIP
     if (p->m_isBall)   return 2; // BALL

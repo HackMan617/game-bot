@@ -12,5 +12,9 @@ venv/
 geode-mod/build/
 *.geode
 
-# Live training run logs
+# Training runs: checkpoints, CSV logs, reports
+runs/
+*.pt
+
+# Live training run logs (archived NEAT era)
 live_log/

@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gdbot — live network</title>
+<style>
+  :root {
+    --bg:#0a0c11; --panel:#11141c; --line:#1e2430; --ink:#e8ecf4; --dim:#7f8a9e;
+    --accent:#3fd1ff; --good:#54d68a; --bad:#ff6b6b; --warn:#f2c14b; --portal:#8f7bff;
+    --mono:ui-monospace,"JetBrains Mono","SF Mono",Consolas,monospace;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; }
+  body {
+    background:var(--bg); color:var(--ink); font:13px/1.45 var(--mono);
+    padding:14px; display:flex; flex-direction:column; gap:12px;
+    -webkit-font-smoothing:antialiased;
+  }
+  header {
+    display:flex; align-items:center; gap:18px; flex-wrap:wrap;
+    padding:10px 14px; background:var(--panel); border:1px solid var(--line);
+    border-radius:10px;
+  }
+  .brand { font-size:15px; font-weight:700; letter-spacing:.14em; text-transform:uppercase; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--bad);
+         box-shadow:0 0 10px currentColor; color:var(--bad); }
+  .dot.on { background:var(--good); color:var(--good); }
+  .stats { display:flex; gap:16px; flex-wrap:wrap; margin-left:auto; }
+  .stat { display:flex; flex-direction:column; align-items:flex-end; line-height:1.2; }
+  .stat b { font-size:15px; font-variant-numeric:tabular-nums; }
+  .stat span { font-size:10px; color:var(--dim); letter-spacing:.1em; text-transform:uppercase; }
+
+  main { display:grid; grid-template-columns:minmax(320px,1fr) minmax(420px,1.9fr); gap:12px; }
+  @media (max-width:1100px) { main { grid-template-columns:1fr; } }
+
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:12px; display:flex; flex-direction:column; gap:10px; min-width:0; }
+  .panel h2 { margin:0; font-size:10px; letter-spacing:.16em; text-transform:uppercase;
+              color:var(--dim); font-weight:600; }
+  canvas { display:block; width:100%; }
+  /* the network canvas fills whatever height the grid panel gives the row,
+     rather than sitting in the top half of an over-tall panel */
+  #net { flex:1 1 auto; min-height:440px; }
+
+  .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:11px; color:var(--dim); }
+  .legend i { display:inline-block; width:9px; height:9px; border-radius:2px;
+              margin-right:5px; vertical-align:-1px; }
+
+  .bars { display:grid; grid-template-columns:repeat(auto-fill,minmax(112px,1fr)); gap:6px 12px; }
+  .bar { font-size:10px; color:var(--dim); }
+  .bar .t { display:flex; justify-content:space-between; }
+  .bar .t em { font-style:normal; color:var(--ink); font-variant-numeric:tabular-nums; }
+  .bar .track { height:4px; background:#0a0d13; border-radius:2px; overflow:hidden; margin-top:2px;
+                position:relative; }
+  .bar .fill { position:absolute; top:0; bottom:0; background:var(--accent); border-radius:2px; }
+  .bar .fill.neg { background:var(--warn); }
+
+  .charts { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:760px) { .charts { grid-template-columns:1fr; } }
+
+  .idle { text-align:center; color:var(--dim); padding:26px 10px; }
+  .idle code { color:var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <span class="brand">gdbot</span>
+  <span id="sub" style="color:var(--dim)">connecting…</span>
+  <div class="stats" id="stats"></div>
+</header>
+
+<div class="idle" id="idle">
+  waiting for the trainer — start it with <code>python train.py --sim</code>
+</div>
+
+<main id="main" style="display:none">
+  <section class="panel">
+    <h2>What the bot sees · 24 × 16 occupancy</h2>
+    <canvas id="grid"></canvas>
+    <div class="legend" id="legend"></div>
+    <h2>Kinematic inputs</h2>
+    <div class="bars" id="bars"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Network · convolution → dense → action</h2>
+    <canvas id="net"></canvas>
+  </section>
+</main>
+
+<section class="charts" id="charts" style="display:none">
+  <div class="panel"><h2>Episode return</h2><canvas id="chartR"></canvas></div>
+  <div class="panel"><h2>Furthest reached (%)</h2><canvas id="chartP"></canvas></div>
+</section>
+
+<script>
+"use strict";
+
+// ---- wiring -----------------------------------------------------------------
+const qs = new URLSearchParams(location.search);
+const WS_URL = qs.get("ws") || `ws://${location.hostname || "localhost"}:8766`;
+
+const CHAN_COLOR = ["#4f5d7a", "#ff6b6b", "#f2c14b", "#8f7bff"];
+const PLAYER = "#54d68a";
+// Canvas font parsing does NOT resolve CSS custom properties, so `var(--mono)`
+// here would be silently dropped and every label would fall back to 10px sans.
+const MONO = 'ui-monospace, "JetBrains Mono", "SF Mono", Consolas, monospace';
+
+let meta = null, frame = null, sock = null;
+
+function connect() {
+  sock = new WebSocket(WS_URL);
+  sock.onopen = () => { dot.classList.add("on"); sub.textContent = "live"; };
+  sock.onclose = () => {
+    dot.classList.remove("on"); sub.textContent = "disconnected";
+    setTimeout(connect, 1000);
+  };
+  sock.onerror = () => sock.close();
+  sock.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "meta") { meta = msg; onMeta(); }
+    else if (msg.type === "frame") { frame = msg; }
+  };
+}
+
+function unb64(s) {
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+const dot = document.getElementById("dot");
+const sub = document.getElementById("sub");
+
+function onMeta() {
+  document.getElementById("idle").style.display = "none";
+  document.getElementById("main").style.display = "grid";
+  document.getElementById("charts").style.display = "grid";
+  sub.textContent = `${meta.mode} · ${meta.env} · ${meta.device} · run "${meta.run}"`;
+  document.getElementById("legend").innerHTML =
+    meta.channels.map((c, i) => `<span><i style="background:${CHAN_COLOR[i]}"></i>${c}</span>`).join("")
+    + `<span><i style="background:${PLAYER}"></i>player</span>`;
+  buildBars();
+}
+
+// ---- canvas helpers ---------------------------------------------------------
+function fit(cv, cssH) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth || 600;
+  cv.height = Math.round(cssH * dpr);
+  cv.width = Math.round(w * dpr);
+  cv.style.height = cssH + "px";
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, cssH);
+  return { ctx, w, h: cssH };
+}
+
+/** Size the backing store to whatever CSS box the element already has.
+ *  Unlike fit(), this never writes style.height — so a canvas that CSS stretches
+ *  cannot feed its own height back into the layout. */
+function fitBox(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth || 600, h = cv.clientHeight || 460;
+  cv.width = Math.round(w * dpr);
+  cv.height = Math.round(h * dpr);
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { ctx, w, h };
+}
+
+// Scratch canvas so a feature map is one putImageData + one scaled drawImage
+// rather than a fillRect per cell.
+const scratch = document.createElement("canvas");
+const sctx = scratch.getContext("2d");
+
+/** Draw a w*h block of uint8 magnitudes as a heat tile with row 0 at the bottom. */
+function drawMap(ctx, data, off, w, h, dx, dy, cw, ch, rgb) {
+  scratch.width = w; scratch.height = h;
+  const img = sctx.createImageData(w, h);
+  for (let r = 0; r < h; r++) {
+    for (let c = 0; c < w; c++) {
+      const v = data[off + r * w + c];
+      const p = ((h - 1 - r) * w + c) * 4;     // flip: grid row 0 is the bottom
+      const t = v / 255;
+      img.data[p]     = 12 + rgb[0] * t;
+      img.data[p + 1] = 15 + rgb[1] * t;
+      img.data[p + 2] = 22 + rgb[2] * t;
+      img.data[p + 3] = 255;
+    }
+  }
+  sctx.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(scratch, dx, dy, w * cw, h * ch);
+}
+
+// ---- perception panel -------------------------------------------------------
+function drawGrid() {
+  const [C, H, W] = meta.grid_shape;
+  const cv = document.getElementById("grid");
+  const cell = Math.max(6, Math.floor((cv.clientWidth || 480) / W));
+  const { ctx, w } = fit(cv, cell * H + 2);
+  const g = unb64(frame.grid);
+
+  ctx.fillStyle = "#080a0e";
+  ctx.fillRect(0, 0, w, cell * H + 2);
+  // cell is an integer number of pixels, so centre the leftover rather than
+  // leaving a dead strip down one side
+  ctx.translate(Math.floor((w - W * cell) / 2), 0);
+
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      let hit = -1;
+      for (let ch = 0; ch < C; ch++) if (g[ch * H * W + r * W + c]) { hit = ch; break; }
+      if (hit < 0) continue;
+      ctx.fillStyle = CHAN_COLOR[hit];
+      ctx.fillRect(c * cell + 1, (H - 1 - r) * cell + 1, cell - 1, cell - 1);
+    }
+  }
+  // faint lattice, so empty space still reads as a grid of cells
+  ctx.strokeStyle = "rgba(255,255,255,.035)";
+  ctx.lineWidth = 1;
+  for (let c = 0; c <= W; c++) { ctx.beginPath(); ctx.moveTo(c * cell + .5, 0); ctx.lineTo(c * cell + .5, H * cell); ctx.stroke(); }
+  for (let r = 0; r <= H; r++) { ctx.beginPath(); ctx.moveTo(0, r * cell + .5); ctx.lineTo(W * cell, r * cell + .5); ctx.stroke(); }
+
+  // the player's own cell, positioned from the mod's own layout rather than a
+  // magic number, so changing GRID_BEHIND cannot silently shift the marker
+  const px = meta.player_col * cell, py = (H - 1 - meta.player_row) * cell;
+  ctx.strokeStyle = PLAYER; ctx.lineWidth = 2;
+  ctx.strokeRect(px + 1.5, py + 1.5, cell - 2, cell - 2);
+  ctx.fillStyle = frame.action ? PLAYER : "rgba(84,214,138,.22)";
+  ctx.fillRect(px + 4, py + 4, cell - 7, cell - 7);
+}
+
+// ---- scalar bars ------------------------------------------------------------
+let barEls = [];
+function buildBars() {
+  const host = document.getElementById("bars");
+  host.innerHTML = "";
+  barEls = meta.scalar_names.map((name) => {
+    const d = document.createElement("div");
+    d.className = "bar";
+    d.innerHTML = `<div class="t"><span>${name}</span><em>0.00</em></div>
+                   <div class="track"><div class="fill"></div></div>`;
+    host.appendChild(d);
+    return { val: d.querySelector("em"), fill: d.querySelector(".fill") };
+  });
+}
+function drawBars() {
+  frame.scalars.forEach((v, i) => {
+    const el = barEls[i]; if (!el) return;
+    el.val.textContent = v.toFixed(2);
+    const mag = Math.min(1, Math.abs(v) / 2);          // scalars live in about [-1,2]
+    el.fill.style.width = (mag * 100).toFixed(1) + "%";
+    el.fill.classList.toggle("neg", v < 0);
+  });
+}
+
+// ---- network panel ----------------------------------------------------------
+let stackBudget = 330;   // vertical room a column of maps may use, set per frame
+
+function drawNet() {
+  const cv = document.getElementById("net");
+  const { ctx, w, h } = fitBox(cv);
+  stackBudget = Math.max(240, h - 130);   // leave room for the captions
+  const [C, H, W] = meta.grid_shape;
+  const grid = unb64(frame.grid);
+  const hidden = unb64(frame.hidden);
+  const head = unb64(frame.head);
+
+  // Six columns: raw channels, three conv stages, the dense layer, the action.
+  const pad = 16, n = 6;
+  const span = (w - pad * 2) / n;
+  const cx = (i) => pad + span * (i + 0.5);
+  const boxes = [];
+
+  // column 0 — the four input channels as small tiles. The grid is binary
+  // occupancy, but drawMap reads 0..255 magnitudes, so an occupied cell would
+  // otherwise come through as 1/255 — i.e. black.
+  const gridViz = new Uint8Array(grid.length);
+  for (let i = 0; i < grid.length; i++) gridViz[i] = grid[i] ? 255 : 0;
+
+  const INPUT_RGB = [[70, 100, 170], [255, 90, 90], [242, 193, 75], [143, 123, 255]];
+  boxes.push(drawStack(ctx, cx(0), h / 2, C, W, H, span - 22,
+    (i, dx, dy, cw, ch) => drawMap(ctx, gridViz, i * H * W, W, H, dx, dy, cw, ch,
+                                   INPUT_RGB[i].map(v => v * 0.9)),
+    "input · 4×24×16",
+    (i) => CHAN_COLOR[i] + "88"));   // tint each tile's border to match the legend
+
+  // columns 1..3 — conv feature maps, one column per stage
+  frame.stages.forEach((st, si) => {
+    const data = unb64(st.data);
+    boxes.push(drawStack(ctx, cx(si + 1), h / 2, st.n, st.w, st.h, span - 22,
+      (i, dx, dy, cw, ch) => drawMap(ctx, data, i * st.h * st.w, st.w, st.h, dx, dy, cw, ch,
+                                     [40, 190, 245]),
+      `conv${si + 1} · ${st.n}×${st.w}×${st.h}`));
+  });
+
+  // column 4 — the dense layer as a block of cells
+  boxes.push(drawVector(ctx, cx(4), h / 2, hidden, span - 30, `dense ${hidden.length}`));
+
+  // column 5 — the two actions
+  const outBox = drawActions(ctx, cx(5), h / 2, span - 20);
+  boxes.push(outBox);
+
+  // flow between stages: brightness follows how much that stage is firing
+  for (let i = 0; i < boxes.length - 2; i++) linkStages(ctx, boxes[i], boxes[i + 1]);
+  linkHead(ctx, boxes[4], outBox, hidden, head);
+}
+
+/** Tile `n` maps into two columns and return the bounding box. */
+function drawStack(ctx, cxp, cyp, n, mw, mh, maxW, paint, label, edge) {
+  const cols = n <= 4 ? 1 : 2;
+  const rows = Math.ceil(n / cols);
+  const gap = 3;
+  const tileW = Math.min((maxW - (cols - 1) * gap) / cols, 92);
+  const cw = tileW / mw, ch = Math.min(cw, (stackBudget / rows - gap) / mh);
+  const tileH = mh * ch;
+  const totalH = rows * (tileH + gap) - gap;
+  const x0 = cxp - (cols * (tileW + gap) - gap) / 2;
+  const y0 = cyp - totalH / 2;
+
+  for (let i = 0; i < n; i++) {
+    const dx = x0 + (i % cols) * (tileW + gap);
+    const dy = y0 + Math.floor(i / cols) * (tileH + gap);
+    paint(i, dx, dy, cw, ch);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = edge ? edge(i) : "rgba(255,255,255,.07)";
+    ctx.strokeRect(dx + .5, dy + .5, tileW - 1, tileH - 1);
+  }
+  caption(ctx, cxp, y0 + totalH + 14, label);
+  return { x0, x1: x0 + cols * (tileW + gap) - gap, yc: cyp, h: totalH, kind: "maps" };
+}
+
+/** The dense layer: one cell per unit, arranged in a near-square block. */
+function drawVector(ctx, cxp, cyp, vec, maxW, label) {
+  const n = vec.length;
+  const cols = Math.ceil(Math.sqrt(n * 1.6));
+  const rows = Math.ceil(n / cols);
+  const s = Math.min(maxW / cols, (stackBudget - 30) / rows, 14);
+  const boxW = cols * s, boxH = rows * s;
+  const x0 = cxp - boxW / 2, y0 = cyp - boxH / 2;
+
+  ctx.fillStyle = "#080a0e";
+  ctx.fillRect(x0, y0, boxW, boxH);
+  for (let i = 0; i < n; i++) {
+    const t = vec[i] / 255;
+    if (t < 0.02) continue;
+    ctx.fillStyle = `rgba(84,214,138,${0.15 + t * 0.85})`;
+    ctx.fillRect(x0 + (i % cols) * s, y0 + Math.floor(i / cols) * s, s - 1, s - 1);
+  }
+  ctx.strokeStyle = "rgba(255,255,255,.08)";
+  ctx.strokeRect(x0 + .5, y0 + .5, boxW - 1, boxH - 1);
+  caption(ctx, cxp, y0 + boxH + 14, label);
+  return { x0, x1: x0 + boxW, yc: cyp, h: boxH, cols, rows, s, kind: "vec" };
+}
+
+/** HOLD / RELEASE, sized and lit by their probabilities. */
+function drawActions(ctx, cxp, cyp, maxW) {
+  const names = ["release", "hold"], p = frame.probs;
+  const bw = Math.min(maxW, 118), bh = 44, gap = 26;
+  const y0 = cyp - (bh * 2 + gap) / 2;
+  const x0 = cxp - bw / 2;
+  const ys = [];
+  for (let i = 1; i >= 0; i--) {               // hold on top, release below
+    const y = y0 + (1 - i) * (bh + gap);
+    ys.push(y + bh / 2);
+    const on = frame.action === i;
+    ctx.fillStyle = on ? "rgba(84,214,138,.20)" : "rgba(255,255,255,.03)";
+    ctx.fillRect(x0, y, bw, bh);
+    ctx.fillStyle = i === 1 ? "rgba(84,214,138,.42)" : "rgba(63,209,255,.30)";
+    ctx.fillRect(x0, y + bh - 5, bw * p[i], 5);
+    ctx.strokeStyle = on ? PLAYER : "rgba(255,255,255,.14)";
+    ctx.lineWidth = on ? 2 : 1;
+    ctx.strokeRect(x0 + .5, y + .5, bw - 1, bh - 1);
+    ctx.fillStyle = on ? PLAYER : "#c6cede";
+    ctx.font = "700 13px " + MONO;
+    ctx.textAlign = "center";
+    ctx.fillText(names[i].toUpperCase(), cxp, y + 20);
+    ctx.font = "11px " + MONO;
+    ctx.fillStyle = "#7f8a9e";
+    ctx.fillText(p[i].toFixed(3), cxp, y + 34);
+  }
+  caption(ctx, cxp, y0 + bh * 2 + gap + 14, `value ${frame.value.toFixed(2)}`);
+  return { x0, x1: x0 + bw, yc: cyp, h: bh * 2 + gap, ys, kind: "out" };
+}
+
+function caption(ctx, x, y, text) {
+  ctx.font = "10px " + MONO;
+  ctx.fillStyle = "#5c6577";
+  ctx.textAlign = "center";
+  ctx.fillText(text, x, y);
+}
+
+/** Bundled curves between two stages; alpha rises with downstream activity. */
+function linkStages(ctx, a, b) {
+  const lanes = 9;
+  ctx.lineWidth = 1;
+  for (let i = 0; i < lanes; i++) {
+    const t = (i + 0.5) / lanes;
+    const y1 = a.yc + (t - 0.5) * a.h * 0.92;
+    const y2 = b.yc + (t - 0.5) * b.h * 0.92;
+    const mid = (a.x1 + b.x0) / 2;
+    ctx.strokeStyle = `rgba(63,209,255,${0.05 + 0.10 * Math.sin(Math.PI * t)})`;
+    ctx.beginPath();
+    ctx.moveTo(a.x1, y1);
+    ctx.bezierCurveTo(mid, y1, mid, y2, b.x0, y2);
+    ctx.stroke();
+  }
+}
+
+/** The decision layer, drawn honestly: one edge per sampled unit, green if that
+ *  weight pushes the action up, red if it pushes it down, bright if the unit is
+ *  actually firing right now. */
+function linkHead(ctx, dense, out, hidden, head) {
+  const n = hidden.length, step = Math.max(1, Math.floor(n / 56));
+  ctx.lineWidth = 1;
+  for (let i = 0; i < n; i += step) {
+    const act = hidden[i] / 255;
+    if (act < 0.06) continue;
+    const col = i % dense.cols, row = Math.floor(i / dense.cols);
+    const sx = dense.x1;
+    const sy = dense.yc - dense.h / 2 + row * dense.s + dense.s / 2;
+    for (let o = 0; o < 2; o++) {
+      const w = (head[o * n + i] - 128) / 127;
+      const a = act * Math.abs(w);
+      if (a < 0.05) continue;
+      const ey = out.ys[1 - o];
+      const mid = (sx + out.x0) / 2;
+      ctx.strokeStyle = w >= 0 ? `rgba(84,214,138,${a * .7})` : `rgba(255,107,107,${a * .7})`;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.bezierCurveTo(mid, sy, mid, ey, out.x0, ey);
+      ctx.stroke();
+    }
+    ctx.fillStyle = `rgba(84,214,138,${act})`;
+    ctx.fillRect(sx - 2, sy - 1, 2, 2);
+  }
+}
+
+// ---- charts -----------------------------------------------------------------
+function drawChart(id, series, color, suffix) {
+  const cv = document.getElementById(id);
+  const { ctx, w, h } = fit(cv, 120);
+  ctx.fillStyle = "#080a0e"; ctx.fillRect(0, 0, w, h);
+  if (!series || series.length < 2) return;
+
+  const lo = Math.min(...series), hi = Math.max(...series);
+  // Headroom above the peak, so the max label never sits on top of the trace.
+  const pad = 8, rng = (hi - lo) || 1, top = hi + rng * 0.12;
+  const X = (i) => pad + (w - pad * 2) * i / (series.length - 1);
+  const Y = (v) => h - pad - (h - pad * 2) * (v - lo) / (top - lo);
+
+  ctx.strokeStyle = "rgba(255,255,255,.06)";
+  for (let i = 0; i <= 3; i++) {
+    const y = pad + (h - pad * 2) * i / 3;
+    ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(w - pad, y); ctx.stroke();
+  }
+  const grad = ctx.createLinearGradient(0, pad, 0, h);
+  grad.addColorStop(0, color + "44"); grad.addColorStop(1, color + "00");
+  ctx.beginPath(); ctx.moveTo(X(0), Y(series[0]));
+  series.forEach((v, i) => ctx.lineTo(X(i), Y(v)));
+  ctx.lineTo(X(series.length - 1), h); ctx.lineTo(X(0), h); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+
+  ctx.beginPath(); ctx.moveTo(X(0), Y(series[0]));
+  series.forEach((v, i) => ctx.lineTo(X(i), Y(v)));
+  ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.stroke();
+
+  ctx.font = "10px " + MONO; ctx.textAlign = "left"; ctx.fillStyle = "#7f8a9e";
+  ctx.fillText(`${hi.toFixed(1)}${suffix}`, pad + 2, pad + 8);
+  ctx.fillText(`${lo.toFixed(1)}${suffix}`, pad + 2, h - pad - 1);
+  ctx.textAlign = "right"; ctx.fillStyle = color;
+  ctx.fillText(`${series[series.length - 1].toFixed(1)}${suffix}`, w - pad - 2, pad + 8);
+}
+
+// ---- header stats -----------------------------------------------------------
+const STATS = [
+  ["update", (d) => d.update.toLocaleString()],
+  ["episodes", (d) => d.episodes.toLocaleString()],
+  ["env steps", (d) => d.env_steps.toLocaleString()],
+  ["steps/s", (d) => d.sps.toFixed(0)],
+  ["speed", (d) => d.speed + "×"],
+  ["mean %", (d) => d.recent.toFixed(1)],
+  ["best %", (d) => d.best_ever.toFixed(1)],
+  ["level", (d) => d.level || "—"],
+];
+function drawStats() {
+  const d = frame.hud;
+  document.getElementById("stats").innerHTML = STATS
+    .map(([label, f]) => `<div class="stat"><b>${f(d)}</b><span>${label}</span></div>`)
+    .join("");
+}
+
+// ---- render loop ------------------------------------------------------------
+// Draw on animation frames, not on message arrival: a burst of snapshots costs
+// one repaint, and a background tab costs none at all.
+let seen = null;
+function tick() {
+  if (frame && meta && frame !== seen) {
+    seen = frame;
+    drawStats();
+    drawGrid();
+    drawBars();
+    drawNet();
+    drawChart("chartR", frame.series.returns, "#3fd1ff", "");
+    drawChart("chartP", frame.series.percents, "#54d68a", "%");
+  }
+  requestAnimationFrame(tick);
+}
+
+connect();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

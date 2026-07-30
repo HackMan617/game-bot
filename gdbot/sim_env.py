@@ -1,34 +1,42 @@
 """SimEnv — a fast, deterministic, headless cube simulator.
 
-This is the training ground for the network before the real game is wired up.
-It models the essence of GD cube mode: constant forward auto-scroll, gravity,
-a fixed-impulse jump that only fires from the ground, spikes you must jump over,
-and steps/blocks you must jump onto (running into a wall = death). Same feel as
-the jump mechanic prototyped in `input test.py`, but headless and physics-driven.
+This exists so the trainer, the policy and the viewer can be developed, tested
+and demonstrated with Geometry Dash closed. It models the essence of cube mode:
+constant auto-scroll, gravity, a fixed-impulse jump that only fires from the
+ground, spikes to clear and blocks to land on (running into a wall kills).
 
-Courses are generated deterministically from a seed and are solvable by
-construction, so training and regression tests are fully reproducible.
+It emits the *same* `Obs` as `LiveEnv` — the identical 24x16x4 grid layout and
+the identical scalar vector — so a policy trained here loads and runs against the
+real game unchanged. Internally the sim works in blocks; velocities are scaled to
+GD units (1 block = 30) on the way out so the normalisation matches Live.
+
+Courses are generated from a seed and are solvable by construction, so training
+runs and regression tests are reproducible.
 """
 
 import random
 from typing import List, Tuple
 
-from .env_base import GDEnv
-from .game_state import CUBE, GameState
+import numpy as np
 
-# --- Physics constants (units: blocks, seconds) ---------------------------------
+from .env import COMPLETE_PCT, GDEnv, shape_reward
+from .obs import (CUBE, GRID_BEHIND, GRID_C, GRID_H, GRID_W, Obs, PLAYER_ROW,
+                  build_scalars)
+
+# --- Physics constants (units: blocks, seconds) -------------------------------
 DT = 1.0 / 60.0     # fixed timestep — GD physics are frame-locked
 VX = 10.3           # forward speed (~GD "normal" speed)
 GRAVITY = 90.0      # downward acceleration
 JUMP_V = 20.0       # upward impulse on jump (arc ~= 2.2 blocks high, ~4.5 wide)
 SPIKE_KILL_H = 1.0  # must clear a spike by more than this to survive
+UNITS_PER_BLOCK = 30.0   # GD's cell size, used to report Live-scaled velocities
 
 
 class Course:
     """A level as parallel arrays indexed by integer column.
 
     ground_height[c] = height of the top surface the cube stands on at column c.
-    is_spike[c]      = a deadly spike sits on the surface at column c.
+    is_spike[c]      = a deadly spike sits on that surface.
     """
 
     def __init__(self, ground_height: List[float], is_spike: List[bool]):
@@ -49,8 +57,8 @@ class Course:
 def make_course(seed: int = 0, length: int = 220) -> Course:
     """Generate a deterministic, solvable cube course.
 
-    Obstacles are spaced far enough apart that a single well-timed jump clears
-    each one, so a reactive policy (spike/step ahead -> jump) can always win.
+    Obstacles are spaced far enough apart that one well-timed jump clears each,
+    so a purely reactive policy (see hazard -> jump) can always win.
     """
     rng = random.Random(seed)
     ground = [0.0] * length
@@ -67,7 +75,7 @@ def make_course(seed: int = 0, length: int = 220) -> Course:
         elif kind == "spike2":
             spike[col] = True
             spike[col + 1] = True
-        else:  # step: a short raised block you must jump onto, then fall off
+        else:  # step: a short raised block to jump onto, then fall off
             h = rng.choice([1.0, 2.0])
             blen = rng.randint(2, 4)
             for c in range(col, min(col + blen, length)):
@@ -77,17 +85,24 @@ def make_course(seed: int = 0, length: int = 220) -> Course:
 
 
 class SimEnv(GDEnv):
-    def __init__(self, course: Course, render: bool = False):
-        self.course = course
-        self.render = render
-        self.render_fps = 60      # raise for snappier demos (e.g. watch_learn.py)
-        self._screen = None
-        self._clock = None
-        self._font = None
+    """Headless cube simulator speaking the `GDEnv` contract."""
+
+    def __init__(self, course: Course = None, seed: int = 0,
+                 max_steps: int = 5000, reseed_each_episode: bool = False):
+        self.course = course if course is not None else make_course(seed)
+        self.seed = seed
+        self.max_steps = max_steps
+        # Rotating the course per episode is what stops the policy memorising a
+        # single layout — the sim analogue of training across many real levels.
+        self.reseed_each_episode = reseed_each_episode
+        self._episode = 0
         self.reset()
 
-    # --- GDEnv interface --------------------------------------------------------
-    def reset(self) -> GameState:
+    # --- GDEnv ---------------------------------------------------------------
+    def reset(self) -> Obs:
+        if self.reseed_each_episode and self._episode:
+            self.course = make_course(self.seed + self._episode)
+        self._episode += 1
         self.px = 1.0
         self.py = self.course.surface(1)
         self.vy = 0.0
@@ -95,13 +110,17 @@ class SimEnv(GDEnv):
         self.dead = False
         self.complete = False
         self.percent = 0.0
-        return self._state()
+        self._best_pct = 0.0
+        self._steps = 0
+        return self._obs()
 
-    def step(self, action: int):
+    def step(self, action: int) -> Tuple[Obs, float, bool, dict]:
         if self.dead or self.complete:
-            return self._state(), 0.0, True, {}
+            return self._obs(), 0.0, True, self._info(timeout=False)
 
-        prev_py = self.py  # height at end of previous tick (used to detect landings)
+        prev_py = self.py       # height at the end of the last tick (detects landings)
+        prev_pct = self.percent
+        self._steps += 1
 
         # 1. Jump only fires from the ground (classic cube).
         if action and self.on_ground:
@@ -121,125 +140,83 @@ class SimEnv(GDEnv):
         # 4. Resolve against the surface.
         if self.py <= surface:
             if prev_py >= surface - 1e-6:
-                # Descended onto the surface (or already on it) -> land.
-                self.py = surface
+                self.py = surface          # descended onto it -> land
                 self.vy = 0.0
                 self.on_ground = True
             else:
-                # Body is below the top of the column we walked into -> wall hit.
-                self.dead = True
+                self.dead = True           # body below the column we walked into
         else:
             self.on_ground = False
 
-        # 5. Spikes: deadly unless cleared by more than SPIKE_KILL_H.
+        # 5. Spikes are deadly unless cleared by more than SPIKE_KILL_H.
         if self.course.spike(col) and self.py <= surface + SPIKE_KILL_H:
             self.dead = True
 
         # 6. Progress / completion.
         self.percent = min(1.0, self.px / self.course.length)
-        if self.px >= self.course.length - 1:
+        self._best_pct = max(self._best_pct, self.percent)
+        if self.percent >= COMPLETE_PCT:
             self.complete = True
 
-        done = self.dead or self.complete
-        return self._state(), self._reward(), done, {}
+        timeout = self._steps >= self.max_steps
+        reward = shape_reward(self.percent - prev_pct, self.dead, self.complete)
+        done = self.dead or self.complete or timeout
+        return self._obs(), reward, done, self._info(timeout)
 
-    def close(self) -> None:
-        if self._screen is not None:
-            import pygame
-            pygame.quit()
-            self._screen = None
+    # --- observation ---------------------------------------------------------
+    def _grid(self) -> np.ndarray:
+        """Rasterise the course around the player into the shared grid layout.
 
-    # --- helpers ----------------------------------------------------------------
-    def _reward(self) -> float:
-        """Dense reward for the (later) RL path; NEAT uses max-percent instead."""
-        if self.dead:
-            return -1.0
-        if self.complete:
-            return 10.0
-        return VX * DT * 0.1  # small reward for surviving forward progress
+        Row PLAYER_ROW is the player's own row and column GRID_BEHIND is its own
+        column, matching what the mod publishes, so the two backends put the same
+        feature in the same cell.
+        """
+        g = np.zeros((GRID_C, GRID_H, GRID_W), dtype=np.float32)
+        base_col = int(self.px) - GRID_BEHIND
+        for w in range(GRID_W):
+            surface = self.course.surface(base_col + w)
+            # Channel 0 (solid): everything below the top surface is ground.
+            top_row = PLAYER_ROW + int(np.floor(surface - self.py))
+            lo = max(0, min(GRID_H, top_row))
+            if lo > 0:
+                g[0, :lo, w] = 1.0
+            # Channel 1 (hazard): a spike sits on the surface cell itself.
+            if self.course.spike(base_col + w) and 0 <= top_row < GRID_H:
+                g[1, top_row, w] = 1.0
+        return g
 
-    def _state(self) -> GameState:
-        course = self.course
-        base_col = int(self.px)
-
-        def lookahead(k: int):
-            return [
-                (course.surface(base_col + i), course.spike(base_col + i))
-                for i in range(1, k + 1)
-            ]
-
-        return GameState(
-            player_x=self.px,
-            player_y=self.py,
-            vy=self.vy,
-            on_ground=self.on_ground,
-            gamemode=CUBE,
-            dead=self.dead,
-            complete=self.complete,
-            percent=self.percent,
-            lookahead=lookahead,
+    def _obs(self) -> Obs:
+        return Obs(
+            grid=self._grid(),
+            scalars=build_scalars(
+                on_ground=self.on_ground,
+                vy=self.vy * UNITS_PER_BLOCK,          # blocks/s -> GD units/s
+                upside_down=False,
+                player_speed=1.0, gravity_mod=1.0, vehicle_size=1.0,
+                y=self.py * UNITS_PER_BLOCK, ground_y=0.0, ceiling_y=0.0,
+                gamemode=CUBE,
+            ),
         )
 
-    # --- optional visualization -------------------------------------------------
-    def draw_game(self, surface, rect, overlay: str = None) -> None:
-        """Draw the course + cube into `rect` on an existing surface.
+    def _info(self, timeout: bool) -> dict:
+        return {"percent": self.percent, "best_percent": self._best_pct,
+                "dead": self.dead, "complete": self.complete, "timeout": timeout,
+                "steps": self._steps, "x": self.px, "y": self.py,
+                "level_id": 0, "checkpoints": 0}
 
-        Factored out so a combined view (watch.py) can render the game and the
-        neural-network panel into one window.
-        """
-        import pygame
 
-        PX = 22  # pixels per block
-        floor_y = rect.y + rect.height - 40
+if __name__ == "__main__":   # eyeball the grid the same way `bridge --grid` does
+    import time
 
-        prev_clip = surface.get_clip()
-        surface.set_clip(rect)
-        pygame.draw.rect(surface, (18, 18, 28), rect)
+    from .obs import grid_to_ascii
 
-        cam = self.px - 5  # keep the cube ~5 blocks from the left edge
-        for c in range(max(0, int(cam) - 1), min(self.course.length, int(cam) + 44)):
-            sx = rect.x + int((c - cam) * PX)
-            top = floor_y - int(self.course.surface(c) * PX)
-            pygame.draw.rect(surface, (55, 55, 78), (sx, top, PX + 1, rect.bottom - top))
-            if self.course.spike(c):
-                pygame.draw.polygon(
-                    surface, (225, 70, 70),
-                    [(sx, top), (sx + PX // 2, top - PX), (sx + PX, top)],
-                )
-
-        cube_x = rect.x + int((self.px - cam) * PX)
-        cube_y = floor_y - int(self.py * PX) - PX
-        color = (225, 70, 70) if self.dead else (90, 220, 130)
-        pygame.draw.rect(surface, color, (cube_x, cube_y, PX, PX))
-        surface.set_clip(prev_clip)
-
-        if overlay:
-            if self._font is None:
-                self._font = pygame.font.SysFont("consolas", 18)
-            surface.blit(self._font.render(overlay, True, (235, 235, 245)),
-                         (rect.x + 10, rect.y + 8))
-
-    def render_frame(self, overlay: str = None) -> None:
-        if not self.render:
-            return
-        import pygame
-
-        W, H = 900, 420
-        if self._screen is None:
-            pygame.init()
-            pygame.font.init()
-            self._screen = pygame.display.set_mode((W, H))
-            self._clock = pygame.time.Clock()
-            pygame.display.set_caption("gdbot — SimEnv")
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.render = False
-                pygame.quit()
-                self._screen = None
-                return
-
-        self._screen.fill((10, 10, 16))
-        self.draw_game(self._screen, pygame.Rect(0, 0, W, H), overlay=overlay)
-        pygame.display.flip()
-        self._clock.tick(self.render_fps)
+    env = SimEnv(seed=1)
+    obs = env.reset()
+    while True:
+        print("\033[H\033[J", end="")
+        print(f"x={env.px:6.1f}  y={env.py:5.2f}  {env.percent * 100:5.1f}%\n")
+        print(grid_to_ascii(obs.grid))
+        obs, _r, done, _i = env.step(0)
+        if done:
+            obs = env.reset()
+        time.sleep(0.05)

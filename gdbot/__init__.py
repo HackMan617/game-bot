@@ -1,15 +1,19 @@
-"""gdbot — a NEAT-driven bot that learns to play Geometry Dash (GD 2.2).
+"""gdbot — a bot that learns to play Geometry Dash (GD 2.2).
 
-Architecture: one Gym-style environment interface (`env_base.GDEnv`) with two
-interchangeable backends —
+The stack, bottom to top:
 
-    SimEnv   : a fast, deterministic, headless pygame cube simulator used to
-               develop and train the network without the real game.
-    LiveEnv  : the real Geometry Dash executable, via memory reading (pymem)
-               and input injection (Windows SendInput).  [Phase 2+]
+    bridge     the shared-memory + event protocol spoken by the Geode mod: a
+               24x16x4 occupancy grid per frame, and a handshake that makes the
+               game wait for us instead of us polling for it
+    obs        the observation contract — grid + scalars — that both backends emit
+    env        GDEnv, and LiveEnv on top of the bridge
+    sim_env    SimEnv, the same contract with no game running
+    policy     the conv actor-critic, and the activations the viewer draws
+    ppo        rollout buffer, GAE, clipped-surrogate update
+    telemetry  the one-way channel to the browser viewer, off the hot path
 
-The learning code (neat_core, later rl_core) is written against GDEnv only, so
-switching from Sim to Live requires no change to the network or training loop.
+Training never renders. `train.py` runs headless at full speed and publishes a
+snapshot only while a viewer is connected; `viewer/index.html` draws it.
 """
 
-__all__ = ["env_base", "sim_env", "observation", "game_state", "neat_core"]
+__all__ = ["bridge", "obs", "env", "sim_env", "policy", "ppo", "telemetry"]
