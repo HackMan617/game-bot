@@ -216,7 +216,15 @@ class Bridge:
 
     # --- config --------------------------------------------------------------
     def set_speed(self, n: int) -> None:
-        """Physics steps per rendered frame (1..32). One step = one decision."""
+        """How many rendered frames to skip presenting (1 = present every frame).
+
+        This is NOT a physics multiplier. Skipping presents removes the vsync wait,
+        which measured 0.6x -> 1.0x real time, and there it stops: GD gates its own
+        stepping internally, so postUpdate never fires faster than 60Hz however
+        much render work is skipped. Live training therefore runs at about 1x real
+        time (~60 decisions/s) no matter what this is set to; anything above 2 only
+        makes the window update less often.
+        """
         self._w(_O_SPEED, max(1, min(32, int(n))))
 
     def set_fast_respawn(self, on: bool) -> None:

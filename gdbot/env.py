@@ -64,9 +64,15 @@ class GDEnv(ABC):
 class LiveEnv(GDEnv):
     """Real Geometry Dash, driven through the GDBot Bridge mod."""
 
+    # fast_respawn defaults OFF because it is currently broken: skipping GD's
+    # death animation re-enters the death sequence and the respawned player dies
+    # again, spinning the attempt counter (measured live: 4000+ attempts at 0.00%
+    # and the level unusable until the flag is cleared). Deferring the reset to
+    # the top of the frame and adding a delay cut it to ~9x too many respawns, not
+    # zero, so it stays opt-in. GD's own ~1s auto-retry is the reliable path.
     def __init__(self, bridge: Optional[Bridge] = None, *, speed: int = 4,
                  step_hz: int = 60, practice: bool = False,
-                 fast_respawn: bool = True, mute: bool = True,
+                 fast_respawn: bool = False, mute: bool = True,
                  max_steps: int = 12000, stall_steps: int = 600):
         self.b = bridge or Bridge(attach=False)
         self.practice = practice

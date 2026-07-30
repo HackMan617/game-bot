@@ -133,8 +133,11 @@ static float        g_lastCpX     = -1e9f;
 static int          g_currentLvl  = 0;
 static bool         g_needReset   = false;
 static int          g_unanswered  = 0;
-static int          g_appliedSpeed = 1;
 static bool         g_muted       = false;
+static int          g_appliedSpeed = 1;
+static float        g_lastRespawnX = 0.f;  // how far the last attempt got
+static int          g_deadRespawns = 0;    // respawns in a row that went nowhere
+static int          g_resetDelay   = 0;    // frames waited so far before respawning
 
 // Per-level spatial index: objects bucketed by (int)(x / CELL), so a frame only
 // scans the ~GRID_W buckets in front of the player instead of every object.
@@ -269,13 +272,12 @@ class $modify(BridgePlayLayer, PlayLayer) {
         ensureShared();
         if (!g_shared) return;
 
-        // Fast respawn: destroyPlayer flagged a death, so restart now instead of
-        // sitting through the ~1s death animation and auto-retry delay.
-        if (g_needReset) {
-            g_needReset = false;
-            this->resetLevel();
-            return;
-        }
+        // NOTE: fast respawn is deliberately NOT handled here. Calling
+        // resetLevel() from inside postUpdate lands in the middle of PlayLayer's
+        // own update chain, mid death sequence, and the respawned player dies again
+        // on the very next frame — an unrecoverable death/reset loop that spins the
+        // attempt counter forever (measured: 4000+ attempts, 0.00%, ~18fps). The
+        // reset now happens at the top of the frame in the scheduler hook instead.
 
         auto p = m_player1;
         if (!p) return;
@@ -358,9 +360,25 @@ class $modify(BridgePlayLayer, PlayLayer) {
         // bound is what keeps a stalled or crashed agent from freezing the game.
         g_shared->state_seq += 1;
         if (g_shared->attached && g_evState && g_evAction) {
+            // Drop any answer left over from an earlier frame before advertising
+            // this one. Without this a single timeout desyncs the pair forever:
+            // the stale signal satisfies the wait immediately, the seq check fails,
+            // and the mod stops waiting at all from then on — measured as the game
+            // free-running at ~240fps while the agent caught only 1 frame in 4.
+            ResetEvent(g_evAction);
             SetEvent(g_evState);
-            if (WaitForSingleObject(g_evAction, ACTION_WAIT_MS) == WAIT_OBJECT_0 &&
-                g_shared->action_seq == g_shared->state_seq) {
+
+            bool answered = false;
+            const DWORD deadline = GetTickCount() + ACTION_WAIT_MS;
+            for (;;) {
+                const DWORD now = GetTickCount();
+                const DWORD left = (now >= deadline) ? 0 : (deadline - now);
+                if (WaitForSingleObject(g_evAction, left) != WAIT_OBJECT_0) break;
+                if (g_shared->action_seq == g_shared->state_seq) { answered = true; break; }
+                if (left == 0) break;   // an older frame's answer; out of time
+            }
+
+            if (answered) {
                 g_unanswered = 0;
             } else if (++g_unanswered > ATTACH_TIMEOUT) {
                 log::warn("GDBot Bridge: agent stopped answering — detaching");
@@ -380,8 +398,10 @@ class $modify(BridgePlayLayer, PlayLayer) {
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         PlayLayer::destroyPlayer(player, object);
-        if (g_shared && g_shared->fast_respawn && player == m_player1 && !m_hasCompletedLevel)
+        if (g_shared && g_shared->fast_respawn && player == m_player1 && !m_hasCompletedLevel) {
+            g_lastRespawnX = player->getPositionX();   // feeds the loop backstop
             g_needReset = true;
+        }
     }
 
     void resetLevel() {
@@ -488,6 +508,32 @@ class $modify(BridgeScheduler, CCScheduler) {
         // loop the scheduler to go faster: GD gates its own stepping internally,
         // so extra calls are no-ops (measured — 16 calls produced 1 postUpdate).
         const bool driving = g_shared && g_shared->attached;
+
+        // Fast respawn, at the TOP of the frame and outside PlayLayer's update
+        // chain. Doing it from postUpdate re-entered the death sequence and looped
+        // forever (see the note there).
+        // Let the death sequence actually finish before restarting. Resetting on
+        // the very next frame re-enters it and the respawned player dies again;
+        // a few frames of slack is still ~50ms against GD's ~1s auto-retry.
+        if (g_shared && g_needReset && ++g_resetDelay >= 4) {
+            g_needReset = false;
+            g_resetDelay = 0;
+            if (auto pl = PlayLayer::get()) {
+                // Backstop: if respawning never gets the player moving, something is
+                // wrong, and spinning resets makes the game unusable. Give up on
+                // fast respawn rather than lock the level into a loop.
+                g_deadRespawns = (g_lastRespawnX >= 1.f) ? 0 : g_deadRespawns + 1;
+                if (g_deadRespawns > 20) {
+                    g_shared->fast_respawn = 0;
+                    g_deadRespawns = 0;
+                    log::warn("GDBot Bridge: fast respawn made no progress 20x — "
+                              "disabling it so the level can recover");
+                } else {
+                    pl->resetLevel();
+                }
+            }
+        }
+
         if (driving) {
             const int hz = g_shared->step_hz > 0 ? g_shared->step_hz : 60;
             dt = 1.0f / static_cast<float>(hz);
@@ -496,8 +542,20 @@ class $modify(BridgeScheduler, CCScheduler) {
 
         if (!g_shared) return;
 
-        // Remove the frame-pacing sleep while driving, so the loop runs as fast
-        // as the agent can answer.
+        // Collapse the frame-pacing sleep while an agent drives. This is NOT a
+        // speedup — it is what keeps the handshake in lockstep. Removing it was
+        // tried and measured: the render loop free-ran at ~240fps, the mod outran
+        // the agent, and 1650 of every 2250 published frames went unanswered. With
+        // it, every speed setting reports zero missed frames.
+        //
+        // The 60 steps/s ceiling is not ours to lift: GD gates its own stepping, so
+        // postUpdate never fires faster however much render work is skipped (16
+        // CCScheduler::update calls were measured to produce exactly one postUpdate).
+        // Live training runs at about 1x real time, and that is the honest number.
+        //
+        // Known cost: while attached the window stops presenting new frames, so the
+        // game looks frozen on a stale image even though it is training correctly.
+        // Detach (or stop the trainer) to watch it play.
         const int wantSpeed = driving ? std::clamp(g_shared->speed, 1, 32) : 0;
         if (wantSpeed != g_appliedSpeed) {
             CCDirector::get()->setAnimationInterval(driving ? 1.0 / 100000.0 : 1.0 / 60.0);

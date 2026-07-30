@@ -87,9 +87,51 @@ is nothing to memorise:
 | 456k | 80.6 | 99.9 | 0.472 |
 | 743k | 86.5 | 99.9 | 0.456 |
 
-Roughly 1 850 steps/s on CPU with no viewer attached. `python report.py <run>`
+Roughly 1 850 steps/s on CPU with no viewer attached — about 50x what the live
+game allows, which is why the simulator exists. `python report.py <run>`
 turns a run's CSV logs into `runs/<run>/report.pdf` — learning curve, PPO health
 diagnostics, and the distribution of individual attempts.
+
+## Running on the real game
+
+Verified live against GD 2.2081 / Geode 5.8.2 on Stereo Madness. The mod loads the
+level itself, so you can start from the menu:
+
+```bash
+python -m gdbot.bridge --grid     # check perception first — trust this before training
+python train.py --level 1         # train on Stereo Madness
+```
+
+Measured on the live game, `step_hz=60` (so 60 steps/s is exactly 1x real time):
+
+| `--speed` | steps/s | vs real time | missed frames | handshake p50 |
+|---|---|---|---|---|
+| 1 | 35 | 0.6x | 0 | 13 µs |
+| 2 | 59 | 1.0x | 0 | 10 µs |
+| 4 | 60 | 1.0x | 0 | 11 µs |
+| 16 | 60 | 1.0x | 0 | 11 µs |
+
+**There is no wall-clock speedup, and `--speed` above 2 does nothing.** Skipping
+presents lifts throughput from 0.6x to 1.0x and then it stops dead: GD gates its
+own stepping, so `postUpdate` never fires faster however much render work is
+skipped (16 `CCScheduler::update` calls were measured to produce exactly one
+`postUpdate`). Live training runs at about 1x real time — roughly 50x slower than
+the simulator, so develop against `--sim` and use the live game to validate.
+
+Two known issues, both found by running it:
+
+- **`fast_respawn` is broken and defaults off.** Skipping GD's death animation
+  re-enters the death sequence, so the respawned player dies again immediately —
+  an unrecoverable loop that spun the attempt counter past 4000 at 0.00% and left
+  the level unusable until the flag was cleared. Deferring the reset to the top of
+  the frame and adding a delay cut it to ~9x too many respawns, not zero. The mod
+  now also disables the flag itself after 20 respawns that go nowhere, so it
+  degrades instead of hanging. GD's own ~1s auto-retry is the reliable path.
+- **The game window freezes on a stale frame while an agent is attached.** It is
+  still training correctly underneath — collapsing the frame-pacing interval is
+  what keeps the handshake in lockstep, and removing it was measured to let the
+  render loop free-run at ~240fps with 1650 of every 2250 frames unanswered. Watch
+  the viewer instead; it shows what the bot actually sees.
 
 ## Project layout
 
