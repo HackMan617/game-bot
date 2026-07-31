@@ -56,8 +56,22 @@
   .bar .fill { position:absolute; top:0; bottom:0; background:var(--accent); border-radius:2px; }
   .bar .fill.neg { background:var(--warn); }
 
-  .charts { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
-  @media (max-width:760px) { .charts { grid-template-columns:1fr; } }
+  .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px; }
+
+  .learn { display:grid; grid-template-columns:1.15fr 1fr; gap:20px; }
+  @media (max-width:900px) { .learn { grid-template-columns:1fr; } }
+  .panel h3 { margin:0 0 8px; font-size:11px; font-weight:600; color:#a9b4c8;
+              letter-spacing:.04em; }
+  .hint { margin:8px 0 0; font-size:10.5px; color:var(--dim); line-height:1.5; }
+
+  .dl { margin-bottom:7px; font-size:10.5px; color:var(--dim); }
+  .dl .t { display:flex; justify-content:space-between; }
+  .dl .t b { color:var(--ink); font-weight:600; }
+  .dl .t em { font-style:normal; font-variant-numeric:tabular-nums; }
+  .dl .track { height:7px; background:#0a0d13; border-radius:3px; overflow:hidden;
+               margin-top:3px; }
+  .dl .fill { height:100%; background:linear-gradient(90deg,#3fd1ff,#8f7bff);
+              border-radius:3px; transition:width .25s ease; }
 
   .idle { text-align:center; color:var(--dim); padding:26px 10px; }
   .idle code { color:var(--accent); }
@@ -91,9 +105,33 @@
   </section>
 </main>
 
+<section id="learning" style="display:none">
+  <div class="panel">
+    <h2>Watching it learn · how the network itself is changing</h2>
+    <div class="learn">
+      <div>
+        <h3>conv1 filters — the patterns it has learned to look for</h3>
+        <canvas id="kernels"></canvas>
+        <p class="hint">Each tile is one 3×3 detector, per input channel.
+          <b style="color:var(--good)">Green</b> = excites,
+          <b style="color:var(--bad)">red</b> = inhibits. They start as noise and
+          sharpen into edge and gap detectors as it trains.</p>
+      </div>
+      <div>
+        <h3>Where learning is happening — weight change per update</h3>
+        <div id="deltas"></div>
+        <p class="hint">‖ΔW‖ for each layer on the last PPO update. Bars going
+          quiet mean that layer has converged.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
 <section class="charts" id="charts" style="display:none">
   <div class="panel"><h2>Episode return</h2><canvas id="chartR"></canvas></div>
   <div class="panel"><h2>Furthest reached (%)</h2><canvas id="chartP"></canvas></div>
+  <div class="panel"><h2>Policy entropy — is it committing?</h2><canvas id="chartE"></canvas></div>
+  <div class="panel"><h2>KL per update — step size</h2><canvas id="chartK"></canvas></div>
 </section>
 
 <script>
@@ -442,6 +480,75 @@ function linkHead(ctx, dense, out, hidden, head) {
   }
 }
 
+// ---- "watching it learn" ----------------------------------------------------
+// These two panels read WEIGHTS, not activations. Everything above answers "what
+// is the bot looking at right now"; this answers "what has it actually learned",
+// which is the question you want when staring at a long training run.
+
+/** conv1's kernels: one row per filter, one 3x3 tile per input channel.
+ *  Signed and diverging — green excites, red inhibits, dark is indifferent. */
+function drawKernels(K) {
+  const cv = document.getElementById("kernels");
+  const { n, c, kh, kw } = K, w8 = unb64(K.data);
+  const cell = 7, gap = 4, tileW = kw * cell, tileH = kh * cell;
+  const cols = Math.max(1, Math.min(n, Math.floor(
+    ((cv.clientWidth || 460) - 30) / (c * (tileW + gap) + 16))));
+  const rows = Math.ceil(n / cols);
+  const groupW = c * (tileW + gap) + 16;
+  const { ctx } = fit(cv, rows * (tileH + 13) + 6);
+
+  for (let f = 0; f < n; f++) {
+    const gx = (f % cols) * groupW + 4;
+    const gy = Math.floor(f / cols) * (tileH + 13) + 2;
+    for (let ch = 0; ch < c; ch++) {
+      const ox = gx + ch * (tileW + gap);
+      for (let r = 0; r < kh; r++) {
+        for (let cc = 0; cc < kw; cc++) {
+          // 128 is zero: the encoder maps signed weights around that midpoint.
+          const v = (w8[((f * c + ch) * kh + r) * kw + cc] - 128) / 127;
+          const m = Math.min(1, Math.abs(v));
+          ctx.fillStyle = v >= 0
+            ? `rgba(84,214,138,${0.06 + m * 0.94})`
+            : `rgba(255,107,107,${0.06 + m * 0.94})`;
+          ctx.fillRect(ox + cc * cell, gy + r * cell, cell - 1, cell - 1);
+        }
+      }
+      ctx.strokeStyle = "rgba(255,255,255,.07)";
+      ctx.strokeRect(ox - .5, gy - .5, tileW, tileH);
+    }
+    ctx.font = "9px " + MONO;
+    ctx.fillStyle = "#5c6577";
+    ctx.textAlign = "left";
+    ctx.fillText(`f${f}`, gx, gy + tileH + 9);
+  }
+}
+
+/** Per-layer ‖ΔW‖ on the last update — literally where learning is happening. */
+let deltaEls = null;
+function drawDeltas(layers) {
+  const host = document.getElementById("deltas");
+  if (!deltaEls || deltaEls.length !== layers.length) {
+    host.innerHTML = "";
+    deltaEls = layers.map((L) => {
+      const d = document.createElement("div");
+      d.className = "dl";
+      d.innerHTML = `<div class="t"><span><b>${L.name}</b>
+        <span style="opacity:.6">${L.shape.join("×")}</span></span><em>0</em></div>
+        <div class="track"><div class="fill"></div></div>`;
+      host.appendChild(d);
+      return { val: d.querySelector("em"), fill: d.querySelector(".fill") };
+    });
+  }
+  // Scale against the busiest layer, so the picture is "which layer is moving
+  // most", which stays readable as absolute step sizes decay over training.
+  const peak = Math.max(1e-9, ...layers.map((L) => L.delta));
+  layers.forEach((L, i) => {
+    const el = deltaEls[i];
+    el.val.textContent = L.delta < 1e-4 ? L.delta.toExponential(1) : L.delta.toFixed(4);
+    el.fill.style.width = (L.delta / peak * 100).toFixed(1) + "%";
+  });
+}
+
 // ---- charts -----------------------------------------------------------------
 function drawChart(id, series, color, suffix) {
   const cv = document.getElementById(id);
@@ -471,11 +578,21 @@ function drawChart(id, series, color, suffix) {
   series.forEach((v, i) => ctx.lineTo(X(i), Y(v)));
   ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.stroke();
 
+  // Adaptive precision: KL lives around 0.002, so a fixed 1 decimal printed
+  // "0.0" and "-0.0" for every label and told you nothing.
+  const fmt = (v) => {
+    const a = Math.abs(v);
+    if (a === 0) return "0";
+    if (a < 0.001) return v.toExponential(1);
+    if (a < 0.1) return v.toFixed(4);
+    if (a < 10) return v.toFixed(2);
+    return v.toFixed(1);
+  };
   ctx.font = "10px " + MONO; ctx.textAlign = "left"; ctx.fillStyle = "#7f8a9e";
-  ctx.fillText(`${hi.toFixed(1)}${suffix}`, pad + 2, pad + 8);
-  ctx.fillText(`${lo.toFixed(1)}${suffix}`, pad + 2, h - pad - 1);
+  ctx.fillText(`${fmt(hi)}${suffix}`, pad + 2, pad + 8);
+  ctx.fillText(`${fmt(lo)}${suffix}`, pad + 2, h - pad - 1);
   ctx.textAlign = "right"; ctx.fillStyle = color;
-  ctx.fillText(`${series[series.length - 1].toFixed(1)}${suffix}`, w - pad - 2, pad + 8);
+  ctx.fillText(`${fmt(series[series.length - 1])}${suffix}`, w - pad - 2, pad + 8);
 }
 
 // ---- header stats -----------------------------------------------------------
@@ -509,6 +626,14 @@ function tick() {
     drawNet();
     drawChart("chartR", frame.series.returns, "#3fd1ff", "");
     drawChart("chartP", frame.series.percents, "#54d68a", "%");
+    drawChart("chartE", frame.series.entropy, "#f2c14b", "");
+    drawChart("chartK", frame.series.kl, "#8f7bff", "");
+
+    if (frame.learning) {
+      document.getElementById("learning").style.display = "block";
+      drawKernels(frame.learning.kernels);
+      drawDeltas(frame.learning.layers);
+    }
   }
   requestAnimationFrame(tick);
 }

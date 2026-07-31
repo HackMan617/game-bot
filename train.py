@@ -31,6 +31,11 @@ from gdbot.telemetry import Telemetry, b64
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# Consecutive bridge stalls to absorb before giving up. Generous on purpose: an
+# overnight run should survive hitches, and a genuinely dead game fails fast
+# anyway because recover() cannot reconnect.
+MAX_STALLS = 20
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
@@ -55,6 +60,9 @@ def parse_args():
     p.add_argument("--lam", type=float, default=0.95)
     p.add_argument("--entropy", type=float, default=0.01)
     p.add_argument("--epochs", type=int, default=4, help="PPO epochs per update")
+    p.add_argument("--hidden", type=int, default=256, help="dense trunk width")
+    p.add_argument("--seed", type=int, default=1,
+                   help="simulator course seed (and torch seed)")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--no-viewer", action="store_true", help="do not serve the viewer")
     p.add_argument("--open", action="store_true", help="open the viewer in a browser")
@@ -106,9 +114,25 @@ class RunLog:
         self._up_f.close()
 
 
+def _reset_with_recovery(env, args, tries: int = MAX_STALLS):
+    """env.reset(), but a stall retries instead of ending the run.
+
+    The simulator cannot stall, so this is a no-op there.
+    """
+    for attempt in range(tries):
+        try:
+            return env.reset()
+        except BridgeLost as exc:
+            print(f"\n[stall on reset {attempt + 1}/{tries}] {exc}\n  recovering...")
+            if not env.recover():
+                raise
+            print("  recovered")
+    raise BridgeLost(f"could not start an attempt after {tries} recoveries")
+
+
 def make_env(args):
     if args.sim:
-        return SimEnv(seed=1, reseed_each_episode=True), "simulator"
+        return SimEnv(seed=args.seed, reseed_each_episode=True), "simulator"
     env = LiveEnv(speed=args.speed, step_hz=args.step_hz, practice=args.practice)
     print("Waiting for the GDBot Bridge (start GD, enter a level)...")
     if not env.connect(timeout=120):
@@ -116,12 +140,31 @@ def make_env(args):
     if args.level:
         print(f"Loading level {args.level}: {OFFICIAL_LEVELS.get(args.level, '?')}")
         env.load_level(args.level)
+    else:
+        # Remember whatever level you are already sitting in, so a recovery that
+        # lands on the menu can put us back into the right one.
+        env.level_id = int(env.b.read().get("level_id", 0))
     return env, "Geometry Dash"
 
 
-def snapshot(obs, viz, action, info, hud, series) -> dict:
-    """Everything the viewer draws for one frame, already wire-ready."""
+def _wire_learning(learning) -> dict:
+    """Base64 the kernel block; the rest of the learning snapshot is plain JSON."""
+    if not learning:
+        return None
+    k = learning["kernels"]
+    return {"layers": learning["layers"],
+            "kernels": {"n": k["n"], "c": k["c"], "kh": k["kh"], "kw": k["kw"],
+                        "data": b64(k["data"])}}
+
+
+def snapshot(obs, viz, action, info, hud, series, learning=None) -> dict:
+    """Everything the viewer draws for one frame, already wire-ready.
+
+    `learning` is the weights-and-deltas block. It changes once per PPO update,
+    not once per frame, so it is computed there and simply carried along here.
+    """
     return {
+        "learning": _wire_learning(learning),
         "grid": b64((obs.grid > 0).astype(np.uint8).ravel()),
         "scalars": [round(float(v), 4) for v in obs.scalars],
         "probs": [round(p, 4) for p in viz["probs"]],
@@ -143,13 +186,14 @@ def main():
     run_dir = os.path.join(HERE, "runs", args.run)
     playing = bool(args.play)
 
+    torch.manual_seed(args.seed)          # so a sweep config is reproducible
     env, env_name = make_env(args)
     if playing:
         model, _ck = P.load(args.play, device=device)
         model.eval()
         print(f"Playing {args.play} on {env_name} ({device}) — no learning.")
     else:
-        model = P.ConvActorCritic().to(device)
+        model = P.ConvActorCritic(hidden=args.hidden).to(device)
         os.makedirs(run_dir, exist_ok=True)
     optim = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
@@ -188,12 +232,24 @@ def main():
     returns, percents = deque(maxlen=200), deque(maxlen=200)
     ep_return, episodes = 0.0, 0
     best_mean = resumed_mean   # best rolling-mean percent so far; gates best.pt
+    stalls = 0                 # bridge stalls survived this run
+
+    # Learning-view state: the last weights fingerprint to diff against, and the
+    # PPO health history the viewer sparklines. Both are cheap and only touched
+    # once per update, so an unwatched run barely notices them.
+    fingerprint = model.weight_fingerprint()
+    learning = [model.learning_snapshot(None)]     # boxed so the loop can swap it
+    hist = {k: deque(maxlen=200) for k in ("entropy", "kl", "v_loss", "clip_frac")}
     t_start = time.time()
     level_name = "simulator" if args.sim else OFFICIAL_LEVELS.get(args.level, "")
     update_i = start_update
 
-    obs = env.reset()
     try:
+        # Inside the try on purpose. This used to sit outside it, so a stall while
+        # waiting for the very first attempt killed the run before training began
+        # AND skipped the finally, leaving the mod attached with the game stranded.
+        obs = _reset_with_recovery(env, args)
+
         for update_i in range(start_update, args.updates):
             buf.reset()
             t0, steps0 = time.time(), env_steps
@@ -202,7 +258,29 @@ def main():
                 capture = tele.should_capture()
                 action, logp, value, viz = model.act(obs, greedy=playing,
                                                      introspect=capture)
-                next_obs, reward, done, info = env.step(action)
+                try:
+                    next_obs, reward, done, info = env.step(action)
+                except BridgeLost as exc:
+                    # A stall is a pause, not an ending. This exact failure — one
+                    # hitch past the frame timeout — killed a 7.12h run that was
+                    # still improving, with the game perfectly healthy throughout.
+                    stalls += 1
+                    print(f"\n[stall {stalls}/{MAX_STALLS}] {exc}\n"
+                          f"  recovering (re-attaching, reloading the level if needed)...")
+                    if stalls > MAX_STALLS or not env.recover():
+                        raise
+                    # Close the episode at the discontinuity. Without this, GAE
+                    # bootstraps credit straight across the gap and blends two
+                    # unrelated episodes into one advantage estimate.
+                    if buf.n:
+                        buf.dones[buf.n - 1] = 1.0
+                    ep_return = 0.0
+                    try:
+                        obs = _reset_with_recovery(env, args)
+                    except BridgeLost:
+                        continue          # stalled again mid-reset; recover again
+                    print("  recovered — continuing")
+                    continue
                 env_steps += 1
                 ep_return += reward
 
@@ -229,8 +307,13 @@ def main():
                         "wall": int(time.time() - t_start),
                     }
                     series = {"returns": [round(r, 2) for r in returns],
-                              "percents": [round(p * 100, 2) for p in percents]}
-                    tele.publish(snapshot(obs, viz, action, info, hud, series))
+                              "percents": [round(p * 100, 2) for p in percents],
+                              "entropy": [round(e, 4) for e in hist["entropy"]],
+                              "kl": [round(k, 5) for k in hist["kl"]],
+                              "v_loss": [round(v, 4) for v in hist["v_loss"]],
+                              "clip_frac": [round(c, 4) for c in hist["clip_frac"]]}
+                    tele.publish(snapshot(obs, viz, action, info, hud, series,
+                                          learning=learning[0]))
 
                 obs = next_obs
                 if done:
@@ -246,7 +329,7 @@ def main():
                                      int(info.get("complete", False)),
                                      int(info.get("dead", False))])
                     ep_return = 0.0
-                    obs = env.reset()
+                    obs = _reset_with_recovery(env, args)
 
             sps = (env_steps - steps0) / max(1e-6, time.time() - t0)
             mret = float(np.mean(returns)) if returns else 0.0
@@ -264,6 +347,14 @@ def main():
                                        gamma=args.gamma, lam=args.lam)
             stats = ppo.update(model, optim, buf, adv, ret, epochs=args.epochs,
                                ent_coef=args.entropy)
+
+            for k in hist:
+                hist[k].append(stats[k])
+            # Diff the weights against the pre-update copy: this is what turns the
+            # viewer from "what it sees" into "what it is learning".
+            if tele.viewers:
+                learning[0] = model.learning_snapshot(fingerprint)
+            fingerprint = model.weight_fingerprint()
 
             print(f"[{update_i:5d}] steps {env_steps:>9,}  eps {episodes:>5}  "
                   f"return {mret:7.2f}  mean% {mpct * 100:5.1f}  best% "

@@ -138,6 +138,7 @@ static int          g_appliedSpeed = 1;
 static float        g_lastRespawnX = 0.f;  // how far the last attempt got
 static int          g_deadRespawns = 0;    // respawns in a row that went nowhere
 static int          g_resetDelay   = 0;    // frames waited so far before respawning
+static int          g_menuAttached = 0;    // ticks attached with no level loaded
 
 // Per-level spatial index: objects bucketed by (int)(x / CELL), so a frame only
 // scans the ~GRID_W buckets in front of the player instead of every object.
@@ -507,7 +508,27 @@ class $modify(BridgeScheduler, CCScheduler) {
         // Wall-clock speedup is therefore just render_fps / step_hz. We do NOT
         // loop the scheduler to go faster: GD gates its own stepping internally,
         // so extra calls are no-ops (measured — 16 calls produced 1 postUpdate).
-        const bool driving = g_shared && g_shared->attached;
+        // "Driving" means an agent is attached AND there is a level for it to
+        // drive. Everything gated on this must stay off on the menu.
+        const bool inLevel = PlayLayer::get() != nullptr;
+        const bool driving = g_shared && g_shared->attached && inLevel;
+
+        // Watchdog: an agent that dies without detaching (a crash, a kill, an
+        // exception before its cleanup runs) would otherwise leave `attached` set
+        // forever. postUpdate's own timeout cannot help — it needs a PlayLayer,
+        // and the stranded case is precisely the one without one. Release the
+        // game after ~10s of being attached with no level.
+        if (g_shared && g_shared->attached && !inLevel) {
+            if (++g_menuAttached > 600) {
+                log::warn("GDBot Bridge: attached with no level for 10s — releasing");
+                g_shared->attached = 0;
+                g_shared->speed = 1;
+                g_shared->action = 0;
+                g_menuAttached = 0;
+            }
+        } else {
+            g_menuAttached = 0;
+        }
 
         // Fast respawn, at the TOP of the frame and outside PlayLayer's update
         // chain. Doing it from postUpdate re-entered the death sequence and looped
@@ -542,11 +563,16 @@ class $modify(BridgeScheduler, CCScheduler) {
 
         if (!g_shared) return;
 
-        // Collapse the frame-pacing sleep while an agent drives. This is NOT a
-        // speedup — it is what keeps the handshake in lockstep. Removing it was
-        // tried and measured: the render loop free-ran at ~240fps, the mod outran
-        // the agent, and 1650 of every 2250 published frames went unanswered. With
-        // it, every speed setting reports zero missed frames.
+        // Collapse the frame-pacing sleep while an agent drives A LEVEL. This is
+        // NOT a speedup — it is what keeps the handshake in lockstep. Removing it
+        // was tried and measured: the render loop free-ran at ~240fps, the mod
+        // outran the agent, and 1650 of every 2250 published frames went
+        // unanswered. With it, every speed setting reports zero missed frames.
+        //
+        // The `pl` term matters as much as the `attached` one. The handshake only
+        // exists inside PlayLayer, so collapsing the interval on the menu buys
+        // nothing and spins the game into an unresponsive white window — measured,
+        // after an agent died holding attached=1 with no level loaded.
         //
         // The 60 steps/s ceiling is not ours to lift: GD gates its own stepping, so
         // postUpdate never fires faster however much render work is skipped (16

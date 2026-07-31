@@ -68,6 +68,16 @@ learning to see it.
 </p>
 <p align="center"><em>The four input channels (solid · hazard · orb/pad · portal), 16 filters per conv stage, the dense layer, and the two action heads. The red channel is the network isolating a single spike.</em></p>
 
+**Watching it learn.** Everything above shows what the network *sees*. A second
+panel shows how the network itself is *changing*: conv1's kernels — the only layer
+whose weights read directly as picture detectors — and the per-layer ‖ΔW‖ of the
+last PPO update, so you can see which layer is still moving and which has settled.
+
+<p align="center">
+  <img src="assets/learning.png" alt="The learning panel: conv1 filter kernels and per-layer weight change" width="100%">
+</p>
+<p align="center"><em>Left: 16 conv1 filters, four 3×3 detectors each — green excites, red inhibits. They start as noise and sharpen as it trains. Right: how far each layer moved on the last update.</em></p>
+
 **The viewer.** The trainer never renders. Each step it calls `should_capture()`,
 which is three comparisons and answers `False` unless a browser is actually
 connected and a frame is due at viewer framerate. Only then does it pay for
@@ -77,20 +87,45 @@ whoever is watching, and a slow browser misses frames instead of slowing trainin
 
 ## Results
 
-Against the simulator, with **a freshly generated course every episode** so there
-is nothing to memorise:
+### Real Geometry Dash — Stereo Madness
+
+A single unattended run: **7.12 hours, 1.41 M steps, 1 760 attempts**, from a
+random policy. It reached **52.4%** — nearly triple the ~19% the NEAT version
+plateaued at.
+
+Learning is a staircase. The agent clears an obstacle, piles up against the next
+one, then breaks through:
+
+| tenth of the run | mean % | 90th pct % | best % |
+|---|---|---|---|
+| 1 | 3.6 | 5.5 | 8.9 |
+| 4 | 16.5 | 19.5 | 19.5 |
+| 7 | 20.9 | 26.7 | 26.8 |
+| 10 | **25.0** | **45.3** | **52.4** |
+
+The walls are visible as death clusters: 2–5% (405 deaths), 10–11% (199),
+**18–19% (498 — 28% of every attempt)**, 26–27% (127). Entropy fell 0.693 → 0.238.
+
+It had **not** plateaued when the run ended — the 90th percentile was climbing
+fastest in the final tenth, and the run was cut short by a bridge stall rather
+than by converging. See [`demo/ppo-2026-07-30/`](demo/ppo-2026-07-30/) for the
+raw logs and generated report.
+
+### Simulator
+
+With **a freshly generated course every episode**, so there is nothing to memorise:
 
 | environment steps | mean % of course | best attempt | policy entropy |
 |---|---|---|---|
 | 12k | 12.0 | 27.8 | 0.693 *(uniform — still guessing)* |
 | 70k | 12.4 | 44.4 | 0.657 |
 | 456k | 80.6 | 99.9 | 0.472 |
-| 743k | 86.5 | 99.9 | 0.456 |
+| 819k | 84.2 | 99.9 | 0.460 |
 
-Roughly 1 850 steps/s on CPU with no viewer attached — about 50x what the live
-game allows, which is why the simulator exists. `python report.py <run>`
-turns a run's CSV logs into `runs/<run>/report.pdf` — learning curve, PPO health
-diagnostics, and the distribution of individual attempts.
+It plateaus around 85–89% mean with a 36–48% completion rate, at ~1 850 steps/s
+on CPU — **33× the live game's 56 steps/s**, which is the whole argument for
+keeping it. `python report.py <run>` turns a run's CSV logs into
+`runs/<run>/report.pdf`.
 
 ## Running on the real game
 
@@ -117,6 +152,11 @@ own stepping, so `postUpdate` never fires faster however much render work is
 skipped (16 `CCScheduler::update` calls were measured to produce exactly one
 `postUpdate`). Live training runs at about 1x real time — roughly 50x slower than
 the simulator, so develop against `--sim` and use the live game to validate.
+
+Long runs survive interruptions: if the frame stream stalls, `LiveEnv.recover()`
+re-attaches, reloads the level if the game left it, and training continues from
+where it was. Before that existed, one hitch past the frame timeout ended a
+7-hour run that was still improving.
 
 Two known issues, both found by running it:
 
@@ -147,6 +187,7 @@ Two known issues, both found by running it:
 | `gdbot/telemetry.py` | the one-way channel to the viewer, off the hot path |
 | `viewer/index.html` | the live network view — self-contained, no build step |
 | `train.py` | train / resume / play |
+| `bench.py` | component benchmarks and the hyperparameter sweep |
 | `report.py` | CSV logs → PDF report |
 | `tests/` | protocol tests against a fake mod; stack tests against `SimEnv` |
 
@@ -156,7 +197,18 @@ python tests/test_stack.py        # obs, policy, PPO and telemetry, end to end
 python -m gdbot.bridge --grid     # ASCII view of what the mod is publishing
 python -m gdbot.bridge --bench    # throughput and handshake latency by speed
 python -m gdbot.sim_env           # same ASCII view, from the simulator
+
+python bench.py components        # where the per-decision budget goes (~2 min)
+python bench.py sweep             # hyperparameter sweep in the simulator (~18 min)
 ```
+
+`bench.py sweep` runs the real trainer as a subprocess per config, so it measures
+the shipping code path. The last sweep's finding: **at a fixed sample budget,
+everything that buys more gradient steps per sample wins** — lr 1e-3 (65.5% mean),
+8 epochs (63.2%) and rollout 512 (59.6%) all beat the 3e-4 / 4-epoch / 2048
+defaults (48.3%), and the three worst configs are all "optimise less". Full
+results and caveats in
+[`demo/ppo-2026-07-30/session-report.md`](demo/ppo-2026-07-30/session-report.md).
 
 Mod setup and build steps are in [`geode-mod/README.md`](geode-mod/README.md).
 

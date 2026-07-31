@@ -73,11 +73,16 @@ class LiveEnv(GDEnv):
     def __init__(self, bridge: Optional[Bridge] = None, *, speed: int = 4,
                  step_hz: int = 60, practice: bool = False,
                  fast_respawn: bool = False, mute: bool = True,
-                 max_steps: int = 12000, stall_steps: int = 600):
+                 max_steps: int = 12000, stall_steps: int = 600,
+                 frame_timeout: float = 30.0):
         self.b = bridge or Bridge(attach=False)
         self.practice = practice
         self.max_steps = max_steps
         self.stall_steps = stall_steps
+        # Generous, because a stall is not a death sentence any more (see
+        # recover()). A 7.12h run was lost to a hitch that exceeded the old 10s.
+        self.frame_timeout = frame_timeout
+        self.level_id = 0                  # remembered so recover() can reload it
         self._cfg = dict(speed=speed, step_hz=step_hz,
                          fast_respawn=fast_respawn, mute=mute)
         self._pending_seq: Optional[int] = None
@@ -107,6 +112,63 @@ class LiveEnv(GDEnv):
         self._cfg["speed"] = n
         self.b.set_speed(n)
 
+    def recover(self, timeout: float = 180.0) -> bool:
+        """Get back on the wheel after the frame stream stopped.
+
+        A stall must not end a run. One hitch longer than the frame timeout cost a
+        7.12-hour live run that was still improving — the game was healthy the
+        whole time (verified publishing at 60fps afterwards), but BridgeLost
+        propagated out of the training loop and the process exited.
+
+        Handles all three ways the stream can stop: the mod detaches us after
+        ATTACH_TIMEOUT unanswered frames, the level gets exited, or frames simply
+        pause for a while. Returns False only if the bridge never comes back.
+        """
+        self._pending_seq = None       # the frame we were holding is long gone
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            try:
+                if not self.b.connected():
+                    time.sleep(1.0)
+                    continue
+            except Exception:
+                time.sleep(1.0)
+                continue
+
+            st = self.b.read()
+            # Left the level (or never got back to one) — put us back in it.
+            if not st["in_level"]:
+                if self.level_id:
+                    self.b.load_level(self.level_id)
+                    time.sleep(3.0)
+                else:
+                    time.sleep(1.0)
+                continue
+
+            # Re-apply the whole run config: the mod resets speed and action when
+            # it detaches, so re-attaching alone would leave it half configured.
+            self.b.set_step_hz(self._cfg["step_hz"])
+            self.b.set_speed(self._cfg["speed"])
+            self.b.set_fast_respawn(self._cfg["fast_respawn"])
+            self.b.set_mute(self._cfg["mute"])
+            self.b.attach()
+            if self.practice:
+                self.b.set_practice(True)
+
+            try:                       # confirm frames really are flowing again
+                st = self.b.wait_frame(timeout=15.0)
+            except BridgeLost:
+                continue
+            self._pending_seq = st["state_seq"]
+            self._grid = self.b.read_grid()
+            # Force the next reset() to accept the next attempt as fresh rather
+            # than waiting for an attempt counter that moved while we were away.
+            self._last_attempt = None
+            return True
+
+        return False
+
     # --- the frame handshake -------------------------------------------------
     def _pump(self, jump: bool) -> dict:
         """Answer the frame we are holding, then block for the next one.
@@ -116,7 +178,7 @@ class LiveEnv(GDEnv):
         """
         if self._pending_seq is not None:
             self.b.send_action(jump, self._pending_seq)
-        st = self.b.wait_frame()
+        st = self.b.wait_frame(timeout=self.frame_timeout)
         self._pending_seq = st["state_seq"]
         self._grid = self.b.read_grid()
         return st
@@ -190,6 +252,7 @@ class LiveEnv(GDEnv):
     # --- curriculum ----------------------------------------------------------
     def load_level(self, level_id: int) -> bool:
         ok = self.b.load_level(level_id)
+        self.level_id = int(level_id)      # remembered, so recover() can reload it
         self._last_attempt = None
         return ok
 

@@ -137,6 +137,56 @@ class ConvActorCritic(nn.Module):
         """Policy-head weights (2, hidden) — the one layer worth drawing as edges."""
         return self.pi.weight.detach().cpu().numpy()
 
+    # --- watching it learn ---------------------------------------------------
+    # Everything above shows what the network SEES on this frame. The rest of this
+    # class shows how the network itself is CHANGING — the part you actually want
+    # when the question is "is it learning?" rather than "what is it looking at?".
+
+    def named_layers(self):
+        """The weight tensors worth reporting on, in forward order."""
+        return [("conv1", self.conv1.weight), ("conv2", self.conv2.weight),
+                ("conv3", self.conv3.weight), ("dense", self.fc.weight),
+                ("policy", self.pi.weight), ("value", self.v.weight)]
+
+    @torch.no_grad()
+    def weight_fingerprint(self) -> dict:
+        """A cheap copy of every layer's weights, for diffing against later."""
+        return {n: w.detach().clone() for n, w in self.named_layers()}
+
+    @torch.no_grad()
+    def learning_snapshot(self, previous: Optional[dict] = None) -> dict:
+        """How the weights look now, and how far they moved since `previous`.
+
+        conv1's kernels go over in full: they are only 16x4x3x3, they are the one
+        layer whose weights are directly interpretable as picture detectors, and
+        watching them sharpen out of noise is the clearest visual signal that
+        learning is happening at all.
+        """
+        layers = []
+        for name, w in self.named_layers():
+            wn = w.detach()
+            delta = 0.0
+            if previous is not None and name in previous:
+                delta = float(torch.linalg.vector_norm(wn - previous[name]))
+            layers.append({
+                "name": name,
+                "shape": list(wn.shape),
+                "norm": float(torch.linalg.vector_norm(wn)),
+                "delta": delta,
+                "std": float(wn.std()),
+                "absmax": float(wn.abs().max()),
+            })
+
+        k = self.conv1.weight.detach()            # (out, in, kh, kw)
+        return {
+            "layers": layers,
+            "kernels": {
+                "n": int(k.shape[0]), "c": int(k.shape[1]),
+                "kh": int(k.shape[2]), "kw": int(k.shape[3]),
+                "data": _quantise_signed(k),
+            },
+        }
+
 
 def _quantise(t: torch.Tensor) -> np.ndarray:
     """Magnitudes -> 0..255, scaled by the tensor's own peak."""
@@ -157,14 +207,18 @@ def _quantise_signed(t: torch.Tensor) -> np.ndarray:
 
 
 def save(model: ConvActorCritic, path: str, extra: Optional[dict] = None) -> None:
+    # The width goes in the checkpoint too, so a run trained at a non-default
+    # width reloads instead of failing on a shape mismatch.
     torch.save({"model": model.state_dict(),
                 "grid_shape": model.grid_shape,
                 "n_scalars": model.n_scalars,
+                "hidden": int(model.fc.out_features),
                 **(extra or {})}, path)
 
 
 def load(path: str, device: str = "cpu") -> Tuple[ConvActorCritic, dict]:
     ck = torch.load(path, map_location=device, weights_only=False)
-    model = ConvActorCritic(tuple(ck["grid_shape"]), ck["n_scalars"]).to(device)
+    model = ConvActorCritic(tuple(ck["grid_shape"]), ck["n_scalars"],
+                            hidden=int(ck.get("hidden", 256))).to(device)
     model.load_state_dict(ck["model"])
     return model, ck
