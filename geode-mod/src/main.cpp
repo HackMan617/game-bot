@@ -516,11 +516,16 @@ class $modify(BridgeScheduler, CCScheduler) {
         // Watchdog: an agent that dies without detaching (a crash, a kill, an
         // exception before its cleanup runs) would otherwise leave `attached` set
         // forever. postUpdate's own timeout cannot help — it needs a PlayLayer,
-        // and the stranded case is precisely the one without one. Release the
-        // game after ~10s of being attached with no level.
+        // and the stranded case is precisely the one without one.
+        //
+        // Deliberately slack. A first attempt at 10s fired during GD's own
+        // menu-to-level transition and detached a perfectly healthy agent mid
+        // startup. The counter also resets on any command, because an agent still
+        // issuing commands is by definition alive — so this only ever fires on a
+        // genuinely dead one.
         if (g_shared && g_shared->attached && !inLevel) {
-            if (++g_menuAttached > 600) {
-                log::warn("GDBot Bridge: attached with no level for 10s — releasing");
+            if (++g_menuAttached > 7200) {          // ~2 minutes at 60fps
+                log::warn("GDBot Bridge: attached with no level for 2min — releasing");
                 g_shared->attached = 0;
                 g_shared->speed = 1;
                 g_shared->action = 0;
@@ -601,6 +606,7 @@ class $modify(BridgeScheduler, CCScheduler) {
 
         if (g_shared->cmd_epoch != g_lastCmd) {
             g_lastCmd = g_shared->cmd_epoch;
+            g_menuAttached = 0;   // an agent issuing commands is alive; see above
             const int op = g_shared->cmd_op, arg = g_shared->cmd_arg;
             if (op == CMD_LOAD_LEVEL) {
                 g_practiceOn = false;
