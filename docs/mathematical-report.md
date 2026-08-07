@@ -26,11 +26,16 @@ And one thing fell out of *testing* them that contradicted the analysis:
 
 Point 4 also invalidated two of the three experiments in this document, because
 they had been run on the faster backend before that backend had been validated.
-Both are reported as inconclusive, with the broken versions left visible, because
-the failure mode — an experiment whose arms all sit on a floor and therefore
-cannot resolve anything — is more instructive than the result would have been.
-`experiments.py` has been repinned so they can be run in a regime that answers
-them.
+The broken versions are left visible next to their replacements, because the
+failure mode — an experiment whose arms all sit on a floor, and therefore reports
+tight confident intervals around nothing — is more instructive than the result
+would have been.
+
+Rerun properly, the λ prediction of point 2 comes out **monotone in the predicted
+direction across all four arms, and still not statistically resolvable**: the
+effect is 2.5 pp against a between-seed SD of ~7 pp, so separating it would need
+roughly 120 seeds per arm rather than three (§7.2). It is reported that way
+rather than as a confirmation.
 
 ---
 
@@ -643,9 +648,48 @@ is enough to set the default: **`--envs` defaults to 1.** The speedup is real an
 remains available for the case where wall-clock, not sample count, is the binding
 constraint — but it is opt-in, and the help text says what it costs.
 
-### 7.2 The λ prediction is untested, not refuted
+### 7.2 The λ prediction points the right way, but the experiment cannot resolve it
 
-The first run of `python experiments.py lam` produced this:
+Rerun on the single-environment backend, three seeds, 120 updates each:
+
+| config | $H_{\text{GAE}}$ (steps) | mean % | seed spread | block-bootstrap 95% CI |
+|---|---|---|---|---|
+| λ = 0.90 | 9.2 | 36.1 | 29.0–40.1 | [27.9, 43.6] |
+| λ = 0.95 | 16.8 | 37.0 | 30.7–41.3 | [29.0, 44.6] |
+| λ = 0.97 | 24.1 | 37.8 | 29.2–42.8 | [29.4, 46.0] |
+| λ = 0.99 | 50.3 | **38.6** | 37.9–39.3 | [31.5, 45.3] |
+
+The ordering is **monotone in λ and in the direction §4.3 predicted** — every
+increase in the credit horizon helps, and the arm whose horizon first exceeds the
+26-step jump (λ = 0.97, $H_{\text{GAE}} = 24.1$; λ = 0.99, $H_{\text{GAE}} =
+50.3$) sits at the top. That is four out of four in the predicted order, which a
+coin would manage one time in 24.
+
+It is still not evidence. The whole range spans 2.5 pp while the seed spread
+within a single arm spans 11–14 pp. Estimating the across-seed SD from those
+ranges ($\sigma \approx 7$ pp), separating a 2.5 pp effect at conventional power
+would take
+
+$$n \approx \frac{2\sigma^2 (z_{\alpha/2} + z_\beta)^2}{\Delta^2}
+= \frac{2 (7)^2 (2.80)^2}{(2.5)^2} \approx 120 \text{ seeds per arm}$$
+
+— about 21 hours of compute for this sweep, against the 31 minutes it actually
+got. **Three seeds cannot resolve this and no amount of bootstrapping the
+episodes inside them will change that**, because the dominant variance is
+between seeds, not within them.
+
+One thing in the table is not subtle, though: λ = 0.99's seeds land within 1.4 pp
+of each other where every other arm spreads over 11–14. With $n = 3$ a range is a
+poor statistic and this may be luck, but "a longer credit horizon makes the run
+less seed-dependent" is a sharper and cheaper hypothesis to test than the mean
+effect, and it is the one worth chasing next.
+
+The honest verdict: **the analysis in §4.3 survives contact with the data and is
+not confirmed by it.**
+
+#### The version of this experiment that was wrong
+
+The first run produced this instead:
 
 | config | mean % | block-bootstrap 95% CI |
 |---|---|---|
@@ -654,14 +698,16 @@ The first run of `python experiments.py lam` produced this:
 | λ = 0.97 | 14.5 | [14.1, 15.0] |
 | λ = 0.99 | 14.1 | [13.8, 14.5] |
 
-It is tempting to read that as "λ does not matter, §4.3 was wrong". It is not
-what happened. Every arm ran on `--envs 8`, which §7.1 then showed lands at
-≈14.5% *whatever* it is configured to do — that is the backend's ceiling at this
-budget, not a response to λ. An experiment whose arms all sit on a floor has no
-dynamic range and cannot resolve anything.
+It is tempting to read that as "λ does not matter, §4.3 was wrong" — and note
+that it is *also* monotone-ish and would have supported a story if one had been
+wanted. It measured nothing. Every arm ran on `--envs 8`, which §7.1 then showed
+lands at ≈14.5% *whatever* it is configured to do; that is the backend's ceiling
+at this budget, not a response to λ. An experiment whose arms all sit on a floor
+has no dynamic range and cannot resolve anything, and the tight intervals it
+reports are a measure of how reliably nothing happened.
 
-This is a methodological mistake worth recording rather than quietly fixing: the
-λ and reward experiments were run on a backend before that backend had been
+This is a methodological mistake worth recording rather than quietly deleting:
+the λ and reward experiments were run on a backend before that backend had been
 validated, and the parity result that invalidated them came out of the same
 batch. `experiments.py` now pins every arm of both to `--envs 1`.
 
@@ -740,7 +786,8 @@ configurations is not established either way.
 | 5.5 | No way to tell a working critic from a broken one | Explained variance, logged and plotted |
 | 6.1 | Batch 1 wastes 96% of the per-decision cost on overhead | Vectorised simulator; `auto` device now batch-aware |
 | 7.1 | …but the vectorised rollout is 2.5× worse **per sample** | `--envs` defaults to 1; the speedup is opt-in and its cost is in the help text |
-| 7.2 | Two experiments were run on an unvalidated backend and had no dynamic range | `experiments.py` pins them to `--envs 1`; both reported as inconclusive |
+| 7.2 | Two experiments were run on an unvalidated backend and had no dynamic range | `experiments.py` pins them to `--envs 1`; broken versions kept alongside the reruns |
+| 7.2 | Rerun, λ is monotone in the predicted direction but 2.5 pp against 7 pp of seed noise | Reported as unresolved; ~120 seeds/arm would be needed |
 
 ## 10. Open questions
 
@@ -750,8 +797,11 @@ configurations is not established either way.
   every environment the *same* course seed (isolating decorrelation from course
   diversity), and sweep `--rollout` upward at fixed `--envs` (isolating segment
   length from parallelism). Until then the mechanism is a guess.
-* **Does λ ≈ 0.97 beat 0.95?** §4.3 predicts it from the jump arc and §7.2 failed
-  to test it. `python experiments.py lam` now runs in a regime that can answer it.
+* **Does a longer credit horizon mainly raise the mean, or mainly shrink the
+  seed-to-seed spread?** §7.2 found λ = 0.99's three seeds within 1.4 pp of each
+  other where every other arm spread over 11–14 pp. If that survives more seeds it
+  is both a bigger effect than the 2.5 pp mean shift and far cheaper to detect,
+  since variance differences need fewer samples than mean differences of this size.
 * **Does the $1\times1$ bottleneck (§2.2) hold up?** It should cut the parameter
   count 3× with no loss of spatial information. Untested because it invalidates
   existing checkpoints.

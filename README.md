@@ -203,10 +203,14 @@ out of it that changed the implementation:
   travelled `2E/(E+1)` times the configured target — 1.6× at four epochs, 1.8× at
   eight. It now measures one epoch at a time, and uses the `k₃` estimator, whose
   standard error at the threshold is 1–35% against `k₁`'s 51–83%.
-- **GAE could not span a single jump.** The advantage estimator's horizon is
+- **GAE cannot span a single jump.** The advantage estimator's horizon is
   `1/(1-γλ)` = 16.8 steps; a cube jump takes exactly 26 steps and covers 4.46
   blocks. The decision to jump and its outcome sit further apart than the
-  estimator reaches, which predicts λ ≈ 0.97 should beat the default 0.95.
+  estimator reaches, which predicts λ ≈ 0.97 should beat the default 0.95. Tested:
+  the four arms come out **monotone in the predicted order** (36.1 / 37.0 / 37.8 /
+  38.6 for λ = 0.90 / 0.95 / 0.97 / 0.99) — and the 2.5 pp spread sits inside ~7 pp
+  of seed noise, so it is suggestive and not resolved. Separating it properly would
+  need ~120 seeds per arm.
 - **Progress and survival are the same signal.** The player auto-scrolls at a
   fixed speed, so percent is an affine function of time alive. Inside the
   discount horizon the death penalty moves the value function 4.7× more than the
