@@ -18,3 +18,8 @@ runs/
 
 # Live training run logs (archived NEAT era)
 live_log/
+
+# Local tooling / config — never commit (may hold secrets)
+.claude/
+.mcp.json
+UpgradeLog.htm

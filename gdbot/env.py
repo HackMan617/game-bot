@@ -32,13 +32,27 @@ COMPLETE_PCT = 0.999
 
 
 def shape_reward(gained: float, dead: bool, complete: bool) -> float:
-    """The reward both backends pay out, so Sim and Live score identically."""
+    """The reward every backend pays out, so all three score identically."""
     r = PROGRESS_REWARD * max(0.0, gained)
     if dead:
         r -= DEATH_PENALTY
     if complete:
         r += COMPLETE_BONUS
     return r
+
+
+def shape_reward_vec(gained, dead, complete) -> np.ndarray:
+    """`shape_reward` elementwise, for the vectorised backend.
+
+    Same reason `build_scalars` is shape-polymorphic: one definition of the
+    payout, so a change to the shaping cannot land in one backend and not the
+    others. Both read the module-level constants at call time, which is also
+    what lets `train.py` override them from the command line.
+    """
+    return (PROGRESS_REWARD * np.maximum(0.0, gained)
+            - DEATH_PENALTY * np.asarray(dead, dtype=np.float32)
+            + COMPLETE_BONUS * np.asarray(complete, dtype=np.float32)
+            ).astype(np.float32)
 
 
 class GDEnv(ABC):
@@ -92,6 +106,8 @@ class LiveEnv(GDEnv):
         self._best_pct = 0.0
         self._steps = 0
         self._stalled = 0
+        self._prev_action = 0
+        self._air = 0
 
     # --- connection ----------------------------------------------------------
     def connect(self, timeout: float = 120.0) -> bool:
@@ -210,11 +226,18 @@ class LiveEnv(GDEnv):
         self._best_pct = st["percent"]
         self._steps = 0
         self._stalled = 0
+        self._prev_action = 0
+        self._air = 0
         return self._obs(st)
 
     def step(self, action: int) -> Tuple[Obs, float, bool, dict]:
         st = self._pump(bool(action))
         self._steps += 1
+        # Recorded after the frame is answered, so the observation we hand back
+        # describes the button that produced it — which is the thing an orb cares
+        # about, since GD fires an orb on a fresh click and ignores a held one.
+        self._prev_action = 1 if action else 0
+        self._air = 0 if st["on_ground"] else self._air + 1
 
         dead = bool(st["dead"])
         complete = st["percent"] >= COMPLETE_PCT
@@ -270,5 +293,6 @@ class LiveEnv(GDEnv):
                 vehicle_size=st["vehicle_size"],
                 y=st["y"], ground_y=st["ground_y"], ceiling_y=st["ceiling_y"],
                 gamemode=st["gamemode"],
+                prev_action=float(self._prev_action), air_time=float(self._air),
             ),
         )

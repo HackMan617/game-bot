@@ -21,6 +21,7 @@ plays levels it has never seen — not a memorised macro for one level.
 pip install -r requirements.txt
 
 python train.py --sim              # train against the simulator — no game needed
+python train.py --sim --envs 32    # 32 courses at once — 8x faster, but see below
 python train.py --level 1          # train on real GD (Stereo Madness)
 python train.py --play runs/gd/best.pt --speed 1    # watch it play, no learning
 ```
@@ -55,28 +56,91 @@ game run as fast as the agent can think without the agent ever missing a frame.
 One answered frame is one fixed `1/step_hz` slice of game time, so raising
 `--speed` buys wall-clock throughput and changes nothing the policy experiences.
 
-**The policy.** Three conv layers over the grid, concatenated with 17 kinematic
-scalars (velocity, on-ground, gamemode, gravity, mini, floor and ceiling gaps),
-into a dense trunk with a policy head and a value head, trained with PPO.
+**The policy.** Three conv layers over the grid, concatenated with 19 kinematic
+scalars (velocity, on-ground, gamemode, gravity, mini, floor and ceiling gaps,
+whether the button was already held, and how long the player has been airborne),
+into a dense trunk with a policy head and a value head, trained with PPO. 216,979
+parameters, of which 93% sit in the single dense layer — see
+[the report](docs/mathematical-report.md#22-the-dense-layer-is-93-of-the-parameters-and-19-of-the-arithmetic).
 
 Nothing in the observation says *where in the level* the player is — no x, no
 percent. A policy that can read the clock will memorise a level instead of
 learning to see it.
+
+`prev_action` is not decoration: GD fires an orb on a **fresh** click and ignores
+a held one, so "holding" and "pressing" are different states of the world that
+the observation used to render identically. A memoryless policy cannot recover
+from an aliased observation no matter how long it trains.
+
+**Two rollout backends, one learner.** Live Geometry Dash is a single environment
+stepped inside a frame handshake, so it collects one transition at a time. The
+simulator (`gdbot/vec_env.py`) steps N courses as numpy arrays and the policy
+decides for all of them in one forward pass. That is worth a lot of wall-clock,
+because at batch 1 this network spends **96%** of a decision on Python and
+kernel-launch overhead rather than on its own arithmetic (measured: 395 µs per
+decision at batch 1, 17.4 µs at batch 128, for identical arithmetic).
+
+| `--envs` | rollout steps/s | speedup | mean % after 245k transitions |
+|---|---|---|---|
+| 1 | 2,045 | 1.0× | **37.0** [29.0, 44.6] |
+| 8 | 9,118 | 4.5× | 14.5 [14.0, 14.9] |
+| 32 | 17,210 | 8.4× | 14.7 [14.2, 15.1] |
+| 128 | 50,900 | 24.9× | — |
+
+**The speed is real and it is not free.** `--rollout` is a *transition* budget, so
+every row of that table trains on the same 245k samples — and at equal samples the
+single-environment rollout learns more than twice as well. That is why `--envs`
+defaults to 1 rather than to something fast. Three seeds per arm, scored on the
+last 400 episodes with a moving-block bootstrap; the intervals do not come close
+to overlapping.
+
+The two arms are indistinguishable for the first ~45 updates and diverge after,
+which points at *what* the batch contains rather than at a bug: eight parallel
+courses decorrelate the batch, and this task seems to want the opposite — a
+concentrated run of experience against the one obstacle currently blocking
+progress. [The report](docs/mathematical-report.md#7-experiments) has the full
+measurement and what it does and does not establish.
+
+There is also a hard ceiling on useful parallelism that is not the hardware: GAE
+has an effective horizon of `1/(1-γλ)` ≈ 17 steps, so splitting a rollout into
+segments much shorter than that discards the credit it exists to propagate.
+`train.py` warns when you cross that line.
 
 <p align="center">
   <img src="assets/network.png" alt="Close-up of the network panel: four input channels, three conv stages, the dense layer, and the action heads" width="92%">
 </p>
 <p align="center"><em>The four input channels (solid · hazard · orb/pad · portal), 16 filters per conv stage, the dense layer, and the two action heads. The red channel is the network isolating a single spike.</em></p>
 
+**What actually drove the decision.** The occupancy grid is overlaid with
+*attribution* — |∂ log π(chosen action) / ∂ cell|, the gradient of this frame's
+decision with respect to every cell the network can see. Feature maps show what
+each filter responds to; attribution shows what the **decision** depended on,
+which is the question a human watching actually has. Early in training it smears
+across the floor; a policy that has learned to see lights up on the hazard it is
+reacting to. It costs one backward pass, and only when a browser is connected.
+
+<p align="center">
+  <img src="assets/attribution.png" alt="The occupancy grid with attribution overlaid: the player mid-jump on the left, the glow concentrated on the leading edge of the step ahead" width="72%">
+</p>
+<p align="center"><em>A trained policy, mid-jump. The glow sits on the leading edge of the step it is clearing — not on the floor it left, and not on the empty sky.</em></p>
+
 **Watching it learn.** Everything above shows what the network *sees*. A second
-panel shows how the network itself is *changing*: conv1's kernels — the only layer
-whose weights read directly as picture detectors — and the per-layer ‖ΔW‖ of the
-last PPO update, so you can see which layer is still moving and which has settled.
+row shows how the network itself is *changing*: conv1's kernels — the only layer
+whose weights read directly as picture detectors — the per-layer ‖ΔW‖ of the last
+PPO update, and the per-layer gradient norm read *before* clipping. ‖ΔW‖ says
+where Adam moved; the gradient says where the loss is still pushing, and a conv
+stage whose gradient has collapsed is frozen whatever the optimiser does.
+
+**Is any of it working?** Two more panels answer that directly. *Explained
+variance* — `1 − Var(return − value) / Var(return)` — is the one cheap number that
+separates a critic that has learned something from one that is predicting the
+mean return, in which case every advantage is Monte-Carlo noise. The *advantage
+distribution* shows the shape of what the policy gradient is actually made of.
 
 <p align="center">
   <img src="assets/learning.png" alt="The learning panel: conv1 filter kernels and per-layer weight change" width="100%">
 </p>
-<p align="center"><em>Left: 16 conv1 filters, four 3×3 detectors each — green excites, red inhibits. They start as noise and sharpen as it trains. Right: how far each layer moved on the last update.</em></p>
+<p align="center"><em>Left: 16 conv1 filters, four 3×3 detectors each — green excites, red inhibits. They start as noise and sharpen as it trains. Middle: how far each layer moved on the last update. Right: where the loss is still pushing, on a log scale.</em></p>
 
 **The viewer.** The trainer never renders. Each step it calls `should_capture()`,
 which is three comparisons and answers `False` unless a browser is actually
@@ -126,6 +190,33 @@ It plateaus around 85–89% mean with a 36–48% completion rate, at ~1 850 step
 on CPU — **33× the live game's 56 steps/s**, which is the whole argument for
 keeping it. `python report.py <run>` turns a run's CSV logs into
 `runs/<run>/report.pdf`.
+
+## What the maths says
+
+[`docs/mathematical-report.md`](docs/mathematical-report.md) derives what the
+agent is actually optimising from the constants in the code. Three things came
+out of it that changed the implementation:
+
+- **The trust-region brake was measuring the wrong average.** The KL early-stop
+  compared a mean taken over *every minibatch since the update began*, which
+  includes epoch 1's near-zero KL. It engaged when the current epoch had already
+  travelled `2E/(E+1)` times the configured target — 1.6× at four epochs, 1.8× at
+  eight. It now measures one epoch at a time, and uses the `k₃` estimator, whose
+  standard error at the threshold is 1–35% against `k₁`'s 51–83%.
+- **GAE could not span a single jump.** The advantage estimator's horizon is
+  `1/(1-γλ)` = 16.8 steps; a cube jump takes exactly 26 steps and covers 4.46
+  blocks. The decision to jump and its outcome sit further apart than the
+  estimator reaches, which predicts λ ≈ 0.97 should beat the default 0.95.
+- **Progress and survival are the same signal.** The player auto-scrolls at a
+  fixed speed, so percent is an affine function of time alive. Inside the
+  discount horizon the death penalty moves the value function 4.7× more than the
+  progress reward does, and the completion bonus discounts to 2×10⁻²² — it is a
+  scoreboard, not an incentive.
+
+The report is also honest about what the existing hyperparameter sweep supports:
+once episode autocorrelation is accounted for, a 200-episode rolling mean carries
+a 95% interval of roughly ±11 pp, so the sweep reliably identifies which settings
+are **bad** and barely separates the good ones.
 
 ## Running on the real game
 
@@ -182,13 +273,16 @@ Two known issues, both found by running it:
 | `gdbot/obs.py` | the observation contract both backends emit |
 | `gdbot/env.py` | `GDEnv`, and `LiveEnv` on top of the bridge |
 | `gdbot/sim_env.py` | `SimEnv` — same contract, deterministic, no game required |
-| `gdbot/policy.py` | the conv actor-critic, and the activations the viewer draws |
-| `gdbot/ppo.py` | rollout buffer, GAE, clipped-surrogate update |
+| `gdbot/vec_env.py` | `VecSimEnv` — N of those as numpy arrays, for batched inference |
+| `gdbot/policy.py` | the conv actor-critic, its activations, and input attribution |
+| `gdbot/ppo.py` | rollout buffers, GAE, clipped-surrogate update, diagnostics |
 | `gdbot/telemetry.py` | the one-way channel to the viewer, off the hot path |
 | `viewer/index.html` | the live network view — self-contained, no build step |
 | `train.py` | train / resume / play |
 | `bench.py` | component benchmarks and the hyperparameter sweep |
+| `experiments.py` | the experiments the report cites, with block-bootstrap error bars |
 | `report.py` | CSV logs → PDF report |
+| `docs/mathematical-report.md` | what the agent optimises, derived — and what that implies |
 | `tests/` | protocol tests against a fake mod; stack tests against `SimEnv` |
 
 ```bash
@@ -197,6 +291,8 @@ python tests/test_stack.py        # obs, policy, PPO and telemetry, end to end
 python -m gdbot.bridge --grid     # ASCII view of what the mod is publishing
 python -m gdbot.bridge --bench    # throughput and handshake latency by speed
 python -m gdbot.sim_env           # same ASCII view, from the simulator
+python -m gdbot.vec_env           # vectorised environment throughput by batch size
+python experiments.py lam         # reproduce the GAE-horizon experiment
 
 python bench.py components        # where the per-decision budget goes (~2 min)
 python bench.py sweep             # hyperparameter sweep in the simulator (~18 min)

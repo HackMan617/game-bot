@@ -8,6 +8,7 @@
   :root {
     --bg:#0a0c11; --panel:#11141c; --line:#1e2430; --ink:#e8ecf4; --dim:#7f8a9e;
     --accent:#3fd1ff; --good:#54d68a; --bad:#ff6b6b; --warn:#f2c14b; --portal:#8f7bff;
+    --heat:#ff9d3f;
     --mono:ui-monospace,"JetBrains Mono","SF Mono",Consolas,monospace;
   }
   * { box-sizing:border-box; }
@@ -58,8 +59,18 @@
 
   .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px; }
 
-  .learn { display:grid; grid-template-columns:1.15fr 1fr; gap:20px; }
+  .learn { display:grid; grid-template-columns:1.25fr 1fr 1fr; gap:20px; }
+  @media (max-width:1250px) { .learn { grid-template-columns:1fr 1fr; } }
   @media (max-width:900px) { .learn { grid-template-columns:1fr; } }
+
+  /* the attribution toggle sits in the perception panel's own header row */
+  .head { display:flex; align-items:baseline; gap:12px; }
+  .head h2 { margin:0; }
+  .toggle { margin-left:auto; display:flex; align-items:center; gap:6px;
+            font-size:10px; letter-spacing:.1em; text-transform:uppercase;
+            color:var(--dim); cursor:pointer; user-select:none; }
+  .toggle input { accent-color:var(--accent); cursor:pointer; margin:0; }
+  .toggle.on { color:var(--heat); }
   .panel h3 { margin:0 0 8px; font-size:11px; font-weight:600; color:#a9b4c8;
               letter-spacing:.04em; }
   .hint { margin:8px 0 0; font-size:10.5px; color:var(--dim); line-height:1.5; }
@@ -92,9 +103,20 @@
 
 <main id="main" style="display:none">
   <section class="panel">
-    <h2>What the bot sees · 24 × 16 occupancy</h2>
+    <div class="head">
+      <h2>What the bot sees · 24 × 16 occupancy</h2>
+      <label class="toggle" id="salToggle">
+        <input type="checkbox" id="salOn" checked>attribution
+      </label>
+    </div>
     <canvas id="grid"></canvas>
     <div class="legend" id="legend"></div>
+    <p class="hint" id="salHint">The glow is <b style="color:var(--heat)">attribution</b>
+      — |∂&thinsp;log&thinsp;π(chosen action) / ∂&thinsp;cell|, the gradient of this
+      decision with respect to each cell of the grid. Bright cells are the ones
+      that actually changed the decision. Early in training it smears over the
+      floor; a policy that has learned to see lights up on the hazard it is
+      reacting to.</p>
     <h2>Kinematic inputs</h2>
     <div class="bars" id="bars"></div>
   </section>
@@ -123,6 +145,15 @@
         <p class="hint">‖ΔW‖ for each layer on the last PPO update. Bars going
           quiet mean that layer has converged.</p>
       </div>
+      <div>
+        <h3>Gradient norm per layer — where the signal reaches</h3>
+        <div id="grads"></div>
+        <p class="hint">‖∂L/∂W‖, averaged over the update's minibatches and read
+          <em>before</em> clipping. ‖ΔW‖ above says where Adam moved; this says
+          where the loss is actually pushing. Log scale over four decades: the
+          dense layer holds 93% of the parameters, so on a linear axis nothing
+          else would be visible.</p>
+      </div>
     </div>
   </div>
 </section>
@@ -132,6 +163,20 @@
   <div class="panel"><h2>Furthest reached (%)</h2><canvas id="chartP"></canvas></div>
   <div class="panel"><h2>Policy entropy — is it committing?</h2><canvas id="chartE"></canvas></div>
   <div class="panel"><h2>KL per update — step size</h2><canvas id="chartK"></canvas></div>
+  <div class="panel">
+    <h2>Explained variance — is the critic real?</h2>
+    <canvas id="chartV"></canvas>
+    <p class="hint">1 − Var(return − value) ⁄ Var(return). At 0 the value head is
+      no better than guessing the mean return, which makes every advantage pure
+      Monte-Carlo noise. Below 0 it is worse than a constant.</p>
+  </div>
+  <div class="panel">
+    <h2>Advantage distribution</h2>
+    <canvas id="chartA"></canvas>
+    <p class="hint">Where the last update's advantages landed, before
+      normalisation. A spike at zero with nothing either side means the rollout
+      carried no learning signal at all.</p>
+  </div>
 </section>
 
 <script>
@@ -177,7 +222,8 @@ function onMeta() {
   document.getElementById("idle").style.display = "none";
   document.getElementById("main").style.display = "grid";
   document.getElementById("charts").style.display = "grid";
-  sub.textContent = `${meta.mode} · ${meta.env} · ${meta.device} · run "${meta.run}"`;
+  const params = meta.params ? ` · ${(meta.params / 1000).toFixed(0)}k params` : "";
+  sub.textContent = `${meta.mode} · ${meta.env} · ${meta.device}${params} · run "${meta.run}"`;
   document.getElementById("legend").innerHTML =
     meta.channels.map((c, i) => `<span><i style="background:${CHAN_COLOR[i]}"></i>${c}</span>`).join("")
     + `<span><i style="background:${PLAYER}"></i>player</span>`;
@@ -237,12 +283,38 @@ function drawMap(ctx, data, off, w, h, dx, dy, cw, ch, rgb) {
 }
 
 // ---- perception panel -------------------------------------------------------
+/** Warm sequential ramp for attribution: dark -> amber -> white-hot.
+ *  Deliberately warm, because every occupancy channel is cool — so the question
+ *  "what is there" and the question "what mattered" never share a hue. */
+function heat(t) {
+  const a = 0.92 * t;
+  const g = 60 + 140 * t, b = 30 + 190 * Math.max(0, t - 0.55) / 0.45;
+  return `rgba(255,${g | 0},${b | 0},${a})`;
+}
+
+// Attribution is diffuse by nature — measured on a trained policy, the median
+// cell still carries ~22% of the peak gradient and 45% of cells carry over 25%.
+// Drawn linearly that is a uniform orange wash that says nothing. GAMMA is a
+// display curve only: it is monotone, so it never reorders cells or changes
+// which one is brightest, it just pushes the bulk down so the top decile reads.
+// The wire data stays the honest max-normalised magnitude.
+const SAL_GAMMA = 2.5;
+
+const salOn = document.getElementById("salOn");
+document.getElementById("salToggle").classList.toggle("on", salOn.checked);
+salOn.addEventListener("change", () => {
+  document.getElementById("salToggle").classList.toggle("on", salOn.checked);
+  document.getElementById("salHint").style.display = salOn.checked ? "" : "none";
+  if (frame && meta) drawGrid();
+});
+
 function drawGrid() {
   const [C, H, W] = meta.grid_shape;
   const cv = document.getElementById("grid");
   const cell = Math.max(6, Math.floor((cv.clientWidth || 480) / W));
   const { ctx, w } = fit(cv, cell * H + 2);
   const g = unb64(frame.grid);
+  const sal = (salOn.checked && frame.saliency) ? unb64(frame.saliency) : null;
 
   ctx.fillStyle = "#080a0e";
   ctx.fillRect(0, 0, w, cell * H + 2);
@@ -250,13 +322,29 @@ function drawGrid() {
   // leaving a dead strip down one side
   ctx.translate(Math.floor((w - W * cell) / 2), 0);
 
+  // Attribution goes down first, filling the whole cell. The occupancy squares
+  // then sit inset on top of it, so the heat reads as a halo around each block
+  // instead of being hidden underneath one.
+  if (sal) {
+    for (let r = 0; r < H; r++) {
+      for (let c = 0; c < W; c++) {
+        const t = Math.pow(sal[r * W + c] / 255, SAL_GAMMA);
+        if (t < 0.02) continue;
+        ctx.fillStyle = heat(t);
+        ctx.fillRect(c * cell, (H - 1 - r) * cell, cell, cell);
+      }
+    }
+  }
+
+  const inset = sal ? 3 : 1;
   for (let r = 0; r < H; r++) {
     for (let c = 0; c < W; c++) {
       let hit = -1;
       for (let ch = 0; ch < C; ch++) if (g[ch * H * W + r * W + c]) { hit = ch; break; }
       if (hit < 0) continue;
       ctx.fillStyle = CHAN_COLOR[hit];
-      ctx.fillRect(c * cell + 1, (H - 1 - r) * cell + 1, cell - 1, cell - 1);
+      ctx.fillRect(c * cell + inset, (H - 1 - r) * cell + inset,
+                   cell - inset * 2 + 1, cell - inset * 2 + 1);
     }
   }
   // faint lattice, so empty space still reads as a grid of cells
@@ -549,7 +637,72 @@ function drawDeltas(layers) {
   });
 }
 
+/** Per-layer ‖∂L/∂W‖ on the last update — where the loss is still pushing.
+ *  Log-scaled across four decades: gradient magnitudes between a 3×3 conv kernel
+ *  and a 200k-parameter dense layer differ by orders of magnitude, and on a
+ *  linear scale every layer but the largest is pinned at zero and unreadable. */
+let gradEls = null;
+function drawGrads(layers, grads) {
+  const host = document.getElementById("grads");
+  const names = layers.map((L) => L.name).filter((n) => n in grads);
+  if (!names.length) {
+    host.innerHTML = `<p class="hint" style="margin:0">gradients appear on the
+      next PPO update</p>`;
+    gradEls = null;
+    return;
+  }
+  if (!gradEls || gradEls.length !== names.length) {
+    host.innerHTML = "";
+    gradEls = names.map((n) => {
+      const d = document.createElement("div");
+      d.className = "dl";
+      d.innerHTML = `<div class="t"><span><b>${n}</b></span><em>0</em></div>
+                     <div class="track"><div class="fill"></div></div>`;
+      host.appendChild(d);
+      return { val: d.querySelector("em"), fill: d.querySelector(".fill") };
+    });
+  }
+  const DECADES = 4;
+  const peak = Math.max(1e-12, ...names.map((n) => grads[n]));
+  names.forEach((n, i) => {
+    const v = grads[n], el = gradEls[i];
+    el.val.textContent = v < 1e-3 ? v.toExponential(1) : v.toFixed(4);
+    const frac = v <= 0 ? 0 : Math.max(0, 1 + Math.log10(v / peak) / DECADES);
+    el.fill.style.width = (frac * 100).toFixed(1) + "%";
+  });
+}
+
 // ---- charts -----------------------------------------------------------------
+/** The advantage distribution as a histogram, with zero marked.
+ *  Advantages are what the policy gradient is actually made of, so their shape
+ *  is more diagnostic than any scalar summary of them. */
+function drawHist(id, hist, color) {
+  const cv = document.getElementById(id);
+  const { ctx, w, h } = fit(cv, 120);
+  ctx.fillStyle = "#080a0e"; ctx.fillRect(0, 0, w, h);
+  if (!hist || !hist.counts || !hist.counts.length) return;
+
+  const counts = hist.counts, n = counts.length;
+  const peak = Math.max(1, ...counts);
+  const pad = 8, bw = (w - pad * 2) / n;
+  for (let i = 0; i < n; i++) {
+    const bh = (h - pad * 2) * counts[i] / peak;
+    ctx.fillStyle = color + "cc";
+    ctx.fillRect(pad + i * bw, h - pad - bh, Math.max(1, bw - 1), bh);
+  }
+  // zero line — the sign of an advantage is the sign of the update it produces
+  if (hist.lo < 0 && hist.hi > 0) {
+    const zx = pad + (w - pad * 2) * (0 - hist.lo) / (hist.hi - hist.lo);
+    ctx.strokeStyle = "rgba(255,255,255,.35)";
+    ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(zx, pad); ctx.lineTo(zx, h - pad); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.font = "10px " + MONO; ctx.fillStyle = "#7f8a9e";
+  ctx.textAlign = "left";  ctx.fillText(hist.lo.toFixed(2), pad + 2, h - pad - 2);
+  ctx.textAlign = "right"; ctx.fillText(hist.hi.toFixed(2), w - pad - 2, h - pad - 2);
+}
+
 function drawChart(id, series, color, suffix) {
   const cv = document.getElementById(id);
   const { ctx, w, h } = fit(cv, 120);
@@ -601,6 +754,7 @@ const STATS = [
   ["episodes", (d) => d.episodes.toLocaleString()],
   ["env steps", (d) => d.env_steps.toLocaleString()],
   ["steps/s", (d) => d.sps.toFixed(0)],
+  ["envs", (d) => d.envs || 1],
   ["speed", (d) => d.speed + "×"],
   ["mean %", (d) => d.recent.toFixed(1)],
   ["best %", (d) => d.best_ever.toFixed(1)],
@@ -628,11 +782,14 @@ function tick() {
     drawChart("chartP", frame.series.percents, "#54d68a", "%");
     drawChart("chartE", frame.series.entropy, "#f2c14b", "");
     drawChart("chartK", frame.series.kl, "#8f7bff", "");
+    drawChart("chartV", frame.series.ev, "#ff9d3f", "");
+    drawHist("chartA", frame.adv_hist, "#3fd1ff");
 
     if (frame.learning) {
       document.getElementById("learning").style.display = "block";
       drawKernels(frame.learning.kernels);
       drawDeltas(frame.learning.layers);
+      drawGrads(frame.learning.layers, frame.learning.grads || {});
     }
   }
   requestAnimationFrame(tick);

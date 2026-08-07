@@ -81,13 +81,30 @@ class ConvActorCritic(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
+    def _fit(self, s: torch.Tensor) -> torch.Tensor:
+        """Match the scalar vector to the width this network was built for.
+
+        The observation gained two scalars (prev_action, air_time) after the
+        first live run. Rather than orphan every checkpoint trained before that,
+        a narrower network simply ignores the tail and a wider one sees zeros —
+        one place, so no caller has to know which era a checkpoint came from.
+        """
+        have = s.shape[-1]
+        if have == self.n_scalars:
+            return s
+        if have > self.n_scalars:
+            return s[..., :self.n_scalars]
+        pad = torch.zeros(*s.shape[:-1], self.n_scalars - have,
+                          dtype=s.dtype, device=s.device)
+        return torch.cat([s, pad], dim=-1)
+
     def _tensors(self, grid, scalars):
         d = self.device
         g = torch.as_tensor(np.asarray(grid), dtype=torch.float32, device=d)
         s = torch.as_tensor(np.asarray(scalars), dtype=torch.float32, device=d)
         if g.dim() == 3:
             g, s = g.unsqueeze(0), s.unsqueeze(0)
-        return g, s
+        return g, self._fit(s)
 
     @torch.no_grad()
     def act(self, obs, greedy: bool = False, introspect: bool = False):
@@ -99,9 +116,41 @@ class ConvActorCritic(nn.Module):
         viz = self._pack_viz(logits, value, inner) if introspect else None
         return int(a.item()), float(dist.log_prob(a).item()), float(value.item()), viz
 
+    @torch.no_grad()
+    def act_batch(self, grid: np.ndarray, scalars: np.ndarray,
+                  greedy: bool = False):
+        """N decisions in one forward pass. Returns numpy (a, logp, value).
+
+        This is the whole point of the vectorised environment: at batch 1 this
+        network is kernel-launch bound and CUDA is measurably *slower* than the
+        CPU, but the same 216k parameters amortise across a batch almost for
+        free. One call here replaces N calls to `act`.
+        """
+        g, s = self._tensors(grid, scalars)
+        logits, value, _ = self(g, s)
+        dist = torch.distributions.Categorical(logits=logits)
+        a = torch.argmax(logits, dim=-1) if greedy else dist.sample()
+        return (a.cpu().numpy().astype(np.int64),
+                dist.log_prob(a).cpu().numpy().astype(np.float32),
+                value.cpu().numpy().astype(np.float32))
+
+    @torch.no_grad()
+    def viz_one(self, grid, scalars) -> dict:
+        """The introspection payload for a single state, without re-deciding.
+
+        The vectorised trainer has already sampled its actions in one batched
+        pass; calling `act(introspect=True)` to draw the picture would sample a
+        *second*, different action and the viewer would show a decision the game
+        never received. This just re-runs the forward for one state and packs the
+        activations.
+        """
+        g, s = self._tensors(grid, scalars)
+        logits, value, inner = self(g, s, introspect=True)
+        return self._pack_viz(logits, value, inner)
+
     def evaluate(self, grid, scalars, actions):
         """Batched log-probs / entropy / values for a PPO update."""
-        logits, value, _ = self(grid, scalars)
+        logits, value, _ = self(grid, self._fit(scalars))
         dist = torch.distributions.Categorical(logits=logits)
         return dist.log_prob(actions), dist.entropy(), value
 
@@ -136,6 +185,42 @@ class ConvActorCritic(nn.Module):
     def head_weights(self) -> np.ndarray:
         """Policy-head weights (2, hidden) — the one layer worth drawing as edges."""
         return self.pi.weight.detach().cpu().numpy()
+
+    def saliency(self, grid, scalars, action: Optional[int] = None) -> np.ndarray:
+        """Which cells of the grid actually drove this decision. Returns (H, W).
+
+        This is the gradient of the chosen action's log-probability with respect
+        to the occupancy grid, |d log pi(a|s) / d grid|, summed over the four
+        channels. Feature maps show what each filter responds to; this shows what
+        the *decision* depended on, which is the question a human watching
+        actually has. A policy that has learned to see hazards lights up on the
+        spike it is about to jump; one that is still guessing lights up on the
+        floor it is standing on, or on nothing in particular.
+
+        `torch.autograd.grad` rather than `.backward()` on purpose: this runs
+        inside rollout collection, and backward() would leave gradients sitting
+        on the parameters for the next PPO update to trip over.
+        """
+        g, s = self._tensors(grid, scalars)
+        g = g.detach().requires_grad_(True)
+        logits, _value, _ = self(g, s)
+        if action is None:
+            action = int(torch.argmax(logits, dim=-1).item())
+        chosen = torch.log_softmax(logits, dim=-1)[0, int(action)]
+        grad = torch.autograd.grad(chosen, g)[0]
+        return _quantise(grad[0].abs().sum(0))          # (C,H,W) -> (H,W)
+
+    @torch.no_grad()
+    def grad_snapshot(self) -> dict:
+        """Per-layer gradient norms, read between backward() and the optimiser step.
+
+        Gradient norm is the honest answer to "is this layer still learning?".
+        A conv stage whose gradient has collapsed two orders of magnitude below
+        the dense layer's is, for practical purposes, frozen.
+        """
+        return {name: (float(torch.linalg.vector_norm(w.grad))
+                       if w.grad is not None else 0.0)
+                for name, w in self.named_layers()}
 
     # --- watching it learn ---------------------------------------------------
     # Everything above shows what the network SEES on this frame. The rest of this

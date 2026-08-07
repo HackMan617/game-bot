@@ -112,6 +112,8 @@ class SimEnv(GDEnv):
         self.percent = 0.0
         self._best_pct = 0.0
         self._steps = 0
+        self._prev_action = 0
+        self._air = 0
         return self._obs()
 
     def step(self, action: int) -> Tuple[Obs, float, bool, dict]:
@@ -158,6 +160,10 @@ class SimEnv(GDEnv):
         if self.percent >= COMPLETE_PCT:
             self.complete = True
 
+        # Book-keeping the observation needs but the physics does not.
+        self._prev_action = 1 if action else 0
+        self._air = 0 if self.on_ground else self._air + 1
+
         timeout = self._steps >= self.max_steps
         reward = shape_reward(self.percent - prev_pct, self.dead, self.complete)
         done = self.dead or self.complete or timeout
@@ -195,6 +201,7 @@ class SimEnv(GDEnv):
                 player_speed=1.0, gravity_mod=1.0, vehicle_size=1.0,
                 y=self.py * UNITS_PER_BLOCK, ground_y=0.0, ceiling_y=0.0,
                 gamemode=CUBE,
+                prev_action=float(self._prev_action), air_time=float(self._air),
             ),
         )
 

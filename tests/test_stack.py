@@ -30,6 +30,7 @@ from gdbot.obs import (CHANNEL_NAMES, GRID_SHAPE, N_SCALARS,         # noqa: E40
                        PLAYER_COL, PLAYER_ROW, SCALAR_NAMES, grid_to_ascii)
 from gdbot.sim_env import SimEnv, make_course                        # noqa: E402
 from gdbot.telemetry import Telemetry, b64                           # noqa: E402
+from gdbot.vec_env import VecSimEnv                                   # noqa: E402
 
 _failures = []
 
@@ -292,9 +293,185 @@ def test_websocket():
     check("viewer receives a published frame", result.get("frame", False))
 
 
+# --- the vectorised simulator ------------------------------------------------
+def test_vec_env():
+    """VecSimEnv must be SimEnv, N at a time — not merely something similar.
+
+    A vectorised environment that drifts from the scalar one is the worst kind of
+    bug: nothing crashes, the policy just trains on a slightly different world
+    than the one the tests and the live game describe. So this is exact equality
+    on the grid, not a tolerance.
+    """
+    rng = np.random.default_rng(0)
+    a = SimEnv(seed=1, reseed_each_episode=False)
+    b = VecSimEnv(n_envs=1, seed=1, reseed_each_episode=False)
+    oa = a.reset()
+    (gb, sb) = b.reset()
+
+    bad, episodes = None, 0
+    if not np.array_equal(oa.grid, gb[0]):
+        bad = "grid differs at t=0"
+    for t in range(6000):
+        if bad:
+            break
+        act = int(rng.integers(2))
+        oa, ra, da, ia = a.step(act)
+        (gb, sb), rb, db, ib = b.step(np.array([act]))
+        if abs(ra - float(rb[0])) > 1e-5:
+            bad = f"reward at t={t}: {ra} vs {float(rb[0])}"
+        elif bool(da) != bool(db[0]):
+            bad = f"done at t={t}"
+        elif da:
+            episodes += 1
+            ep = ib["episodes"][0]
+            if abs(ep["best_percent"] - ia["best_percent"]) > 1e-6:
+                bad = f"episode stats at t={t}"
+            # The scalar env returns the terminal frame and resets on the next
+            # call; the vectorised one auto-resets and returns the fresh frame.
+            # Line them up before comparing.
+            oa = a.reset()
+        if not bad and not np.array_equal(oa.grid, gb[0]):
+            bad = f"grid at t={t}"
+        if not bad and not np.allclose(oa.scalars, sb[0], atol=1e-6):
+            bad = f"scalars at t={t}"
+    check("vec env matches the scalar sim step for step", bad is None,
+          bad or f"6000 steps, {episodes} episodes")
+
+    # Independence: two environments on different courses must not interfere.
+    v = VecSimEnv(n_envs=4, seed=1)
+    g, s = v.reset()
+    check("vec obs has the batch shapes the policy expects",
+          g.shape == (4, *GRID_SHAPE) and s.shape == (4, N_SCALARS),
+          f"{g.shape} {s.shape}")
+    courses_differ = not np.array_equal(v.ground[0], v.ground[1])
+    check("each environment gets its own course", courses_differ)
+
+    # Auto-reset: a finished environment must begin a new episode in place,
+    # without disturbing the ones still running.
+    for _ in range(4000):
+        (g, s), r, d, info = v.step(np.zeros(4, dtype=np.int64))
+        if d.any():
+            break
+    check("a finished environment auto-resets", bool(d.any()) and
+          np.all(v.percent[np.nonzero(d)[0]] < 0.05),
+          f"{int(d.sum())} of 4 done")
+    check("finished environments report their episode", len(info["episodes"]) == int(d.sum()))
+
+
+def test_vec_ppo():
+    """GAE over (T, N) must agree with the scalar recursion column by column."""
+    rng = np.random.default_rng(1)
+    T, N = 12, 5
+    rewards = rng.normal(size=(T, N)).astype(np.float32)
+    values = rng.normal(size=(T, N)).astype(np.float32)
+    dones = (rng.random((T, N)) < 0.2).astype(np.float32)
+    last = rng.normal(size=N).astype(np.float32)
+
+    adv_v, ret_v = ppo.compute_gae_vec(rewards, values, dones, last)
+    agrees = True
+    for j in range(N):
+        adv_s, ret_s = ppo.compute_gae(rewards[:, j], values[:, j], dones[:, j],
+                                       float(last[j]))
+        agrees &= np.allclose(adv_s, adv_v[:, j], atol=1e-5)
+        agrees &= np.allclose(ret_s, ret_v[:, j], atol=1e-5)
+    check("vectorised GAE agrees with the scalar recursion", bool(agrees))
+
+    buf = ppo.VecRollout(4, 3, GRID_SHAPE, N_SCALARS)
+    env = VecSimEnv(n_envs=3, seed=2)
+    g, s = env.reset()
+    for i in range(4):
+        acts = np.array([i % 2] * 3)
+        buf.add(g, s, acts, np.full(3, -0.5, np.float32), np.ones(3, np.float32),
+                np.full(3, 0.25, np.float32), np.zeros(3, np.float32))
+        (g, s), _r, _d, _i = env.step(acts)
+    fg, fs, fa, flp, fv = buf.flat()
+    check("vec rollout flattens to one batch",
+          buf.full and buf.transitions == 12 and fg.shape == (12, *GRID_SHAPE)
+          and fs.shape == (12, N_SCALARS) and fa.shape == (12,),
+          f"{fg.shape}")
+
+    # A real update through the vectorised buffer, exercising the same code path
+    # `update()` takes for the flat one.
+    torch.manual_seed(0)
+    model = P.ConvActorCritic()
+    optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+    buf = ppo.VecRollout(32, 4, GRID_SHAPE, N_SCALARS)
+    env = VecSimEnv(n_envs=4, seed=3)
+    g, s = env.reset()
+    while not buf.full:
+        acts, logps, vals = model.act_batch(g, s)
+        (ng, ns), rew, done, _i = env.step(acts)
+        buf.add(g, s, acts, logps, vals, rew, done)
+        g, s = ng, ns
+    adv, ret = ppo.compute_gae_vec(buf.rewards[:buf.n], buf.values[:buf.n],
+                                   buf.dones[:buf.n], np.zeros(4, np.float32))
+    stats = ppo.update(model, optim, buf, adv, ret, epochs=2, batch=32,
+                       collect_grads=True)
+    check("a vectorised update produces finite diagnostics",
+          all(math.isfinite(stats[k]) for k in
+              ("pi_loss", "v_loss", "entropy", "kl", "explained_variance",
+               "grad_norm")),
+          f"ev={stats['explained_variance']:.3f} gn={stats['grad_norm']:.3f}")
+    check("k3 KL is never negative", stats["kl"] >= 0.0, f"{stats['kl']:.6f}")
+    check("per-layer gradients are reported when asked",
+          set(stats["grads"]) == {n for n, _ in model.named_layers()},
+          str(sorted(stats["grads"])))
+
+    ev = ppo.explained_variance(np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 3.0]))
+    check("explained variance is 1 for a perfect critic", close(ev, 1.0))
+    ev0 = ppo.explained_variance(np.array([2.0, 2.0, 2.0]), np.array([1.0, 2.0, 3.0]))
+    check("explained variance is 0 for a mean-predicting critic", close(ev0, 0.0))
+
+
+def test_batched_policy():
+    """act_batch and saliency — the two things the vectorised viewer depends on."""
+    model = P.ConvActorCritic()
+    env = VecSimEnv(n_envs=6, seed=4)
+    g, s = env.reset()
+
+    acts, logps, vals = model.act_batch(g, s)
+    check("act_batch returns one decision per environment",
+          acts.shape == (6,) and logps.shape == (6,) and vals.shape == (6,)
+          and set(np.unique(acts)) <= {0, 1}, str(acts.shape))
+
+    a_g, lp_g, _v = model.act_batch(g, s, greedy=True)
+    a_g2, _lp, _v2 = model.act_batch(g, s, greedy=True)
+    check("greedy act_batch is deterministic", np.array_equal(a_g, a_g2))
+
+    with torch.no_grad():
+        logits, value, _ = model(torch.as_tensor(g), torch.as_tensor(s))
+    check("act_batch values agree with a direct forward",
+          np.allclose(vals, value.numpy(), atol=1e-5))
+    check("greedy act_batch takes the argmax",
+          np.array_equal(a_g, logits.argmax(-1).numpy()))
+
+    sal = model.saliency(g[0], s[0], int(acts[0]))
+    C, H, W = GRID_SHAPE
+    check("saliency is one uint8 magnitude per grid cell",
+          sal.shape == (H, W) and sal.dtype == np.uint8 and sal.max() == 255,
+          f"{sal.shape} max={sal.max()}")
+
+    # Saliency must not leave gradients on the parameters for the next PPO
+    # update to pick up — that would silently corrupt the very first minibatch.
+    dirty = [n for n, p in model.named_parameters() if p.grad is not None]
+    check("saliency leaves no gradient on the parameters", not dirty, str(dirty))
+
+    viz = model.viz_one(g[0], s[0])
+    check("viz_one packs the same payload as introspection",
+          len(viz["probs"]) == 2 and close(sum(viz["probs"]), 1.0)
+          and len(viz["stages"]) == len(model.map_shapes))
+
+    # A narrower checkpoint (pre prev_action/air_time) must still run against the
+    # current 19-scalar observation rather than dying on a shape mismatch.
+    narrow = P.ConvActorCritic(n_scalars=N_SCALARS - 2)
+    a2, _lp2, _v2, _viz2 = narrow.act(SimEnv(seed=1).reset())
+    check("an older, narrower checkpoint still decides", a2 in (0, 1))
+
+
 def main():
     for fn in (test_obs_contract, test_grid_geometry, test_reward, test_policy,
-               test_ppo, test_telemetry, test_websocket):
+               test_batched_policy, test_ppo, test_vec_env, test_vec_ppo,
+               test_telemetry, test_websocket):
         print(f"\n--- {fn.__name__} ---")
         fn()
     print()

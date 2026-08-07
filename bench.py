@@ -318,8 +318,13 @@ def bench_sweep(steps, jobs, tag):
         if os.path.isdir(d):     # a stale run would resume and poison the result
             import shutil
             shutil.rmtree(d, ignore_errors=True)
+        # --envs 1 is pinned, not inherited from train.py's default. This sweep
+        # runs three jobs at once on a thread budget, so the batched rollout path
+        # would be competing with itself for cores and measuring the scheduler
+        # rather than the hyperparameter. It also keeps these numbers comparable
+        # with runs/sweep-results.json, which predates the vectorised backend.
         cmd = [sys.executable, "train.py", "--sim", "--no-viewer", "--device", "cpu",
-               "--run", run, "--seed", "1",
+               "--envs", "1", "--run", run, "--seed", "1",
                "--lr", str(cfg["lr"]), "--entropy", str(cfg["entropy"]),
                "--rollout", str(cfg["rollout"]), "--epochs", str(cfg["epochs"]),
                "--gamma", str(cfg["gamma"]), "--hidden", str(cfg["hidden"]),
