@@ -725,6 +725,38 @@ these runs were not learning. The prediction stands as a prediction. Rerunning o
 the single-environment backend, where the dynamic range is 11% → 37%, is the test
 that would actually settle it.
 
+### 7.4 On the live game, the trust region is never the binding constraint
+
+The corrected stack was run against real Geometry Dash on 2026-08-07 — 432 k
+steps, 732 attempts, λ = 0.99, everything else at defaults (full write-up in
+[`demo/ppo-2026-08-07/session-report.md`](../demo/ppo-2026-08-07/session-report.md)).
+At equal samples it is indistinguishable from the 2026-07-30 run: 19.6% vs 19.5%
+best, 16.1% vs 15.5% final-200 mean, overlapping intervals.
+
+The measurement that matters for §5.4 is this:
+
+> The KL early-stop engaged on **0 of 211 updates**. Median KL was 0.0034 against
+> a configured target of 0.03.
+
+So the brake — corrected or not — never actuated, and §5.4's 1.6× inflation is
+unobservable at these settings because the constraint is nine times slack. What
+bounds the update is $\eta = 3\times10^{-4}$, not the trust region. This gives
+§8's observation that the sweep prefers `lr 1e-3` a mechanism rather than just a
+ranking: the larger learning rate is not competing with the KL brake for control
+of the step size, because the brake is not holding anything.
+
+The per-epoch fix does show in the tail — median KL 0.0034 vs the old run's
+0.0036, but p90 0.0051 vs 0.0079 and max 0.0093 vs 0.0217. The direction matches
+the prediction; with λ and `--rollout` also differing between the runs, it is
+corroboration and not a measurement.
+
+One live observation constrains §4.3 more than the λ sweep did. Both runs die in
+the same half-percent of level: 26% of this run's attempts ended between 19.0%
+and 19.5% (block 169), and nothing passed 19.6%. Two different observation
+vectors and two credit horizons differing by 3× converging on one obstacle says
+the barrier is not in the credit assignment, and that a λ experiment run on
+Stereo Madness would be measuring the wrong thing.
+
 ---
 
 ## 8. What the existing hyperparameter sweep can and cannot support
@@ -805,11 +837,19 @@ configurations is not established either way.
 * **Does the $1\times1$ bottleneck (§2.2) hold up?** It should cut the parameter
   count 3× with no loss of spatial information. Untested because it invalidates
   existing checkpoints.
-* **Does any of this transfer to the live game?** Every experiment here runs
-  against the simulator, whose cube-only physics is a strict subset of Geometry
-  Dash. The simulator has no ship, no wave, no orbs, no portals — and two of the
-  four occupancy channels are never populated. A $\lambda$ that is right for a
-  4.46-block jump arc may be wrong for a ship segment.
+* **Does any of this transfer to the live game?** Every experiment here except
+  §7.4 runs against the simulator, whose cube-only physics is a strict subset of
+  Geometry Dash. The simulator has no ship, no wave, no orbs, no portals — and two
+  of the four occupancy channels are never populated. A $\lambda$ that is right
+  for a 4.46-block jump arc may be wrong for a ship segment. §7.4 gives a partial
+  answer: the corrected stack transfers without regression, but Stereo Madness
+  cannot resolve the questions here because a single obstacle at block 169 caps
+  every run long before credit assignment becomes the limiting factor.
+* **How much learning rate does the slack trust region afford?** §7.4 measured
+  nine times headroom under `--target-kl 0.03` on the live game, unused for all
+  211 updates. Sweeping $\eta$ upward until the brake actually engages would find
+  the largest step this problem tolerates, and would test §8's `lr 1e-3`
+  preference against a mechanism rather than a ranking.
 * **Is the entropy floor safe at scale?** A short vectorised run at
   `--rollout 512 --envs 8` collapsed to $\mathcal{H} = 0.003$ (deterministic
   release) by update 30 and never recovered, at a configuration that also

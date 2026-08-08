@@ -175,6 +175,24 @@ fastest in the final tenth, and the run was cut short by a bridge stall rather
 than by converging. See [`demo/ppo-2026-07-30/`](demo/ppo-2026-07-30/) for the
 raw logs and generated report.
 
+#### Replication with the corrected stack (2026-08-07)
+
+The rewritten observation, the per-epoch KL brake, the k3 estimator and λ = 0.99
+were taken back to the real game: **2.24 hours, 432 k steps, 732 attempts**. At
+equal samples it is **indistinguishable from the run above** — best 19.6% vs
+19.5%, final-200 mean 16.1% vs 15.5%, bootstrap intervals overlapping.
+
+What it did settle is *where* the agent is stuck. Both runs die in the same half
+percent of level: **26% of every attempt ended between 19.0% and 19.5%** (block
+169), and this one never got past 19.6%. Two observation vectors and two credit
+horizons converging on the same obstacle makes that a property of the level, not
+of the learner.
+
+The most actionable number is a negative one: the **KL early-stop engaged on 0 of
+211 updates**, median KL 0.0034 against a 0.03 target. The trust region is not
+what bounds the step — the learning rate is, with ~9× headroom unused. Details in
+[`demo/ppo-2026-08-07/session-report.md`](demo/ppo-2026-08-07/session-report.md).
+
 ### Simulator
 
 With **a freshly generated course every episode**, so there is nothing to memorise:
@@ -253,8 +271,15 @@ re-attaches, reloads the level if the game left it, and training continues from
 where it was. Before that existed, one hitch past the frame timeout ended a
 7-hour run that was still improving.
 
-Two known issues, both found by running it:
+Three known issues, all found by running it:
 
+- **The mod can hang the game, and `--speed 4` is the suspect.** Three times now
+  GD has been left alive and `Responding`, burning CPU, with `CCScheduler::update`
+  stopped and `state_seq` frozen. Because `attached` stays 1, the in-mod watchdog
+  cannot fire and `LiveEnv.recover()` has nothing to re-attach to; only a GD
+  restart clears it. The last two occurrences were both at `--speed 4` and it has
+  never been seen at `--speed 1`. Since `--speed 4` measured 54.9 steps/s against
+  a hard 60 ceiling, it is buying almost nothing for the risk.
 - **`fast_respawn` is broken and defaults off.** Skipping GD's death animation
   re-enters the death sequence, so the respawned player dies again immediately —
   an unrecoverable loop that spun the attempt counter past 4000 at 0.00% and left
